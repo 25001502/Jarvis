@@ -3,8 +3,13 @@ import datetime as dt
 import json
 import platform
 from pathlib import Path
+import re
+import queue
 import subprocess
 import sys
+import threading
+import time
+import uuid
 import webbrowser
 from urllib import error as url_error
 from urllib import request as url_request
@@ -22,13 +27,35 @@ except Exception:
 
 
 class LocalLLMClient:
-    def __init__(self, base_url: str, model: str, timeout_seconds: int = 120) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        model: str,
+        timeout_seconds: int = 60,
+        max_tokens: int = 96,
+        keep_alive: str = "30m",
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.max_tokens = max_tokens
+        self.keep_alive = keep_alive
 
     def _fetch_json(self, endpoint: str) -> dict | None:
         req = url_request.Request(f"{self.base_url}{endpoint}", method="GET")
+        try:
+            with url_request.urlopen(req, timeout=self.timeout_seconds) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except (url_error.URLError, TimeoutError, ValueError):
+            return None
+
+    def _post_json(self, endpoint: str, body: dict) -> dict | None:
+        req = url_request.Request(
+            f"{self.base_url}{endpoint}",
+            method="POST",
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
         try:
             with url_request.urlopen(req, timeout=self.timeout_seconds) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -81,8 +108,47 @@ class LocalLLMClient:
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.4,
+                "temperature": 0.3,
+                "num_predict": self.max_tokens,
             },
+            "keep_alive": self.keep_alive,
+        }
+
+        payload = self._post_json("/api/generate", body)
+        if not payload:
+            return None
+        generated = payload.get("response", "").strip()
+        return generated or None
+
+    def chat(self, messages: list[dict]) -> str | None:
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": {
+                "temperature": 0.45,
+                "num_predict": self.max_tokens,
+            },
+            "keep_alive": self.keep_alive,
+        }
+        payload = self._post_json("/api/chat", body)
+        if not payload:
+            return None
+
+        message = payload.get("message", {})
+        content = message.get("content", "").strip()
+        return content or None
+
+    def prewarm(self) -> None:
+        body = {
+            "model": self.model,
+            "prompt": "Reply with: Ready.",
+            "stream": False,
+            "options": {
+                "temperature": 0,
+                "num_predict": 8,
+            },
+            "keep_alive": self.keep_alive,
         }
 
         req = url_request.Request(
@@ -92,47 +158,279 @@ class LocalLLMClient:
             headers={"Content-Type": "application/json"},
         )
         try:
-            with url_request.urlopen(req, timeout=self.timeout_seconds) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-            generated = payload.get("response", "").strip()
-            return generated or None
+            with url_request.urlopen(req, timeout=min(self.timeout_seconds, 45)):
+                pass
         except (url_error.URLError, TimeoutError, ValueError):
-            return None
+            pass
 
 
 class JarvisAssistant:
     def __init__(
         self,
         use_voice: bool = True,
+        use_microphone: bool | None = None,
         wake_word: str = "jarvis",
         llm_client: LocalLLMClient | None = None,
+        mic_index: int | None = None,
+        listen_timeout: float = 3.0,
+        phrase_time_limit: float = 6.0,
+        mic_calibration_seconds: float = 0.2,
+        memory_file: str = ".jarvis_memory.json",
+        max_history_turns: int = 12,
     ) -> None:
         self.use_voice = use_voice
+        self.use_microphone = use_voice if use_microphone is None else use_microphone
         self.wake_word = wake_word.lower().strip()
         self.tts_engine = None
+        self.voice_warning_printed = False
         self.llm_client = llm_client
+        self.mic_index = mic_index
+        self.listen_timeout = max(listen_timeout, 1.0)
+        self.phrase_time_limit = max(phrase_time_limit, 1.0)
+        self.mic_calibration_seconds = max(mic_calibration_seconds, 0.0)
+        self.memory_file = Path(memory_file)
+        self.max_history_turns = max(max_history_turns, 6)
+        self.recognizer = sr.Recognizer() if self.use_microphone and sr is not None else None
+        self.microphone = None
+        self.microphone_calibrated = False
         self.memory = {
             "user_goal": None,
             "ongoing_task": None,
             "notes": [],
             "previous_commands": [],
+            "reminders": [],
         }
+        self.profile = {
+            "name": None,
+            "preferences": [],
+            "persona_style": "calm, confident, helpful",
+        }
+        self.conversation_history: list[dict] = []
+        self.speech_queue: queue.Queue[str] = queue.Queue()
+        self.tts_worker: threading.Thread | None = None
+        self.tts_stop_event = threading.Event()
+        self.tts_speaking_event = threading.Event()
+        self.reminder_worker: threading.Thread | None = None
+        self.reminder_stop_event = threading.Event()
+        self.barge_in_enabled = True
+
+        if self.recognizer is not None:
+            try:
+                self.microphone = sr.Microphone(device_index=self.mic_index)
+            except Exception:
+                self.recognizer = None
+                self.microphone = None
+                self.use_microphone = False
 
         if self.use_voice and pyttsx3 is not None:
             try:
                 self.tts_engine = pyttsx3.init()
                 self.tts_engine.setProperty("rate", 185)
+                self.tts_engine.setProperty("volume", 1.0)
             except Exception:
                 self.tts_engine = None
 
-    def speak(self, text: str) -> None:
-        print(f"Jarvis: {text}")
-        if self.use_voice and self.tts_engine is not None:
+        if self.tts_engine is not None:
+            self.start_tts_worker()
+
+        self.load_persistent_memory()
+        self.start_reminder_worker()
+
+    def load_persistent_memory(self) -> None:
+        if not self.memory_file.exists():
+            return
+
+        try:
+            payload = json.loads(self.memory_file.read_text(encoding="utf-8"))
+        except Exception:
+            return
+
+        saved_memory = payload.get("memory", {}) if isinstance(payload, dict) else {}
+        saved_profile = payload.get("profile", {}) if isinstance(payload, dict) else {}
+        saved_history = payload.get("conversation_history", []) if isinstance(payload, dict) else []
+
+        if isinstance(saved_memory, dict):
+            self.memory["user_goal"] = saved_memory.get("user_goal")
+            self.memory["ongoing_task"] = saved_memory.get("ongoing_task")
+            self.memory["notes"] = list(saved_memory.get("notes", []))[-8:]
+            loaded_reminders = list(saved_memory.get("reminders", []))
+            valid_reminders = []
+            for item in loaded_reminders:
+                if not isinstance(item, dict):
+                    continue
+                if not item.get("id") or not item.get("title") or not item.get("due_at"):
+                    continue
+                if item.get("status") not in {"pending", "done"}:
+                    item["status"] = "pending"
+                valid_reminders.append(item)
+            self.memory["reminders"] = valid_reminders[-40:]
+
+        if isinstance(saved_profile, dict):
+            self.profile["name"] = saved_profile.get("name")
+            self.profile["preferences"] = list(saved_profile.get("preferences", []))[-10:]
+            self.profile["persona_style"] = saved_profile.get("persona_style", self.profile["persona_style"])
+
+        if isinstance(saved_history, list):
+            filtered_history = []
+            for item in saved_history:
+                if not isinstance(item, dict):
+                    continue
+                role = item.get("role")
+                content = item.get("content")
+                if role in {"user", "assistant"} and isinstance(content, str) and content.strip():
+                    filtered_history.append({"role": role, "content": content.strip()})
+            self.conversation_history = filtered_history[-(self.max_history_turns * 2) :]
+
+    def save_persistent_memory(self) -> None:
+        payload = {
+            "memory": {
+                "user_goal": self.memory.get("user_goal"),
+                "ongoing_task": self.memory.get("ongoing_task"),
+                "notes": self.memory.get("notes", [])[-8:],
+                "reminders": self.memory.get("reminders", [])[-40:],
+            },
+            "profile": {
+                "name": self.profile.get("name"),
+                "preferences": self.profile.get("preferences", [])[-10:],
+                "persona_style": self.profile.get("persona_style", "calm, confident, helpful"),
+            },
+            "conversation_history": self.conversation_history[-(self.max_history_turns * 2) :],
+        }
+
+        try:
+            self.memory_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception:
+            pass
+
+    def append_history(self, role: str, content: str) -> None:
+        cleaned = content.strip()
+        if not cleaned:
+            return
+        self.conversation_history.append({"role": role, "content": cleaned})
+        self.conversation_history = self.conversation_history[-(self.max_history_turns * 2) :]
+
+    def display_name(self) -> str:
+        name = self.profile.get("name")
+        return str(name).strip() if name else "there"
+
+    def prefers_concise_responses(self) -> bool:
+        prefs = self.profile.get("preferences", [])
+        prefs_text = " ".join(str(item).lower() for item in prefs)
+        return any(word in prefs_text for word in ["short", "concise", "brief"])
+
+    def format_llm_response(self, text: str) -> str:
+        cleaned = text.strip()
+        if not cleaned:
+            return cleaned
+
+        if not self.prefers_concise_responses():
+            return cleaned
+
+        # Strip markdown-like list formatting and compress to a few direct sentences.
+        lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+        normalized = " ".join(line.lstrip("-*0123456789. ") for line in lines)
+        sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
+        concise = " ".join(sentences[:3]).strip()
+        if not concise:
+            concise = normalized[:320].strip()
+        return concise
+
+    def start_tts_worker(self) -> None:
+        if self.tts_engine is None:
+            return
+        if self.tts_worker is not None and self.tts_worker.is_alive():
+            return
+
+        self.tts_stop_event.clear()
+        self.tts_worker = threading.Thread(target=self._tts_worker_loop, daemon=True)
+        self.tts_worker.start()
+
+    def _tts_worker_loop(self) -> None:
+        while not self.tts_stop_event.is_set():
+            try:
+                text = self.speech_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if text is None:
+                break
+
+            if self.tts_engine is None:
+                continue
+
+            self.tts_speaking_event.set()
             try:
                 self.tts_engine.say(text)
                 self.tts_engine.runAndWait()
             except Exception:
+                self.tts_engine = None
+            finally:
+                self.tts_speaking_event.clear()
+
+    def is_speaking(self) -> bool:
+        return self.tts_speaking_event.is_set()
+
+    def interrupt_speech(self) -> None:
+        if self.tts_engine is not None:
+            try:
+                self.tts_engine.stop()
+            except Exception:
                 pass
+
+        while not self.speech_queue.empty():
+            try:
+                self.speech_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        self.tts_speaking_event.clear()
+
+    def shutdown(self) -> None:
+        self.interrupt_speech()
+        self.tts_stop_event.set()
+        if self.tts_worker is not None and self.tts_worker.is_alive():
+            self.speech_queue.put_nowait(None)
+        self.reminder_stop_event.set()
+
+    def _speak_with_windows_fallback(self, text: str) -> bool:
+        escaped = text.replace("'", "''")
+        ps_script = (
+            "Add-Type -AssemblyName System.Speech; "
+            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+            f"$s.Speak('{escaped}')"
+        )
+        try:
+            subprocess.run(
+                ["powershell", "-NoProfile", "-Command", ps_script],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=20,
+                check=False,
+            )
+            return True
+        except Exception:
+            return False
+
+    def speak(self, text: str) -> None:
+        print(f"Jarvis: {text}")
+        if self.use_voice and self.tts_engine is not None:
+            if self.tts_worker is not None and self.tts_worker.is_alive():
+                self.speech_queue.put_nowait(text)
+                return
+
+            try:
+                self.tts_engine.say(text)
+                self.tts_engine.runAndWait()
+                return
+            except Exception:
+                self.tts_engine = None
+
+        if self.use_voice and self._speak_with_windows_fallback(text):
+            return
+
+        if self.use_voice and not self.voice_warning_printed:
+            print("Jarvis: Voice output is unavailable. Run with --text-only or fix Windows TTS settings.")
+            self.voice_warning_printed = True
 
     def emit_action(self, action_call: str, explanation: str) -> None:
         print("ACTION:")
@@ -149,34 +447,101 @@ class JarvisAssistant:
             return False, f'Ollama is running, but model "{self.llm_client.model}" is not installed.'
         return True, f'Local LLM ready with model "{self.llm_client.model}".'
 
+    def build_llm_messages(self, user_message: str) -> list[dict]:
+        prefs = self.profile.get("preferences", [])[-5:]
+        notes = self.memory.get("notes", [])[-5:]
+        goal = self.memory.get("user_goal") or "Not set"
+        task = self.memory.get("ongoing_task") or "Not set"
+        prefs_text = " ".join(str(item).lower() for item in prefs)
+        concise_mode = any(word in prefs_text for word in ["short", "concise", "brief"])
+
+        style_hint = (
+            "User prefers short practical answers. Keep responses to 2-4 concise sentences unless they ask for detail."
+            if concise_mode
+            else "Default to concise answers and expand only when asked."
+        )
+
+        system_prompt = (
+            "You are JARVIS, an advanced local personal AI companion. "
+            "Speak naturally like a trusted human assistant: calm, intelligent, concise, and proactive. "
+            "Avoid robotic wording. Keep responses practical and personable. "
+            "Ask clarifying questions if a request is ambiguous. "
+            "Offer a smart next action when helpful. "
+            "Never claim you executed actions unless the user confirms execution happened in their environment. "
+            "When giving advice, prefer concrete steps over abstract statements. "
+            "Avoid markdown bullet lists unless the user explicitly asks for a list. "
+            f"{style_hint}"
+        )
+
+        profile_context = (
+            f"User name: {self.display_name()}\n"
+            f"Current goal: {goal}\n"
+            f"Current task: {task}\n"
+            f"Known preferences: {prefs if prefs else 'None yet'}\n"
+            f"Saved notes: {notes if notes else 'None yet'}\n"
+        )
+
+        messages: list[dict] = [
+            {"role": "system", "content": system_prompt},
+            {"role": "system", "content": f"Conversation memory:\n{profile_context}"},
+        ]
+        messages.extend(self.conversation_history[-(self.max_history_turns * 2) :])
+        messages.append({"role": "user", "content": user_message})
+        return messages
+
     def reply_with_llm(self, command: str) -> bool:
         if self.llm_client is None:
             return False
 
-        llm_ready, _ = self.llm_status()
-        if not llm_ready:
-            return False
-
-        response = self.llm_client.generate(command, self.memory)
+        print("Jarvis: Thinking...")
+        messages = self.build_llm_messages(command)
+        response = self.llm_client.chat(messages)
         if not response:
             return False
 
+        response = self.format_llm_response(response)
+
+        self.append_history("user", command)
+        self.append_history("assistant", response)
+        self.save_persistent_memory()
         self.speak(response)
         return True
 
     def remember_command(self, command: str) -> None:
         self.memory["previous_commands"].append(command)
         self.memory["previous_commands"] = self.memory["previous_commands"][-8:]
+        self.save_persistent_memory()
 
     def update_context_from_command(self, command: str) -> None:
         goal_markers = ["my goal is ", "i am trying to ", "i'm trying to ", "i want to "]
         task_markers = ["i am working on ", "i'm working on "]
+        name_markers = ["my name is ", "call me "]
+        preference_markers = ["i prefer ", "my preference is "]
+
+        for marker in name_markers:
+            if command.startswith(marker):
+                value = command.replace(marker, "", 1).strip(" .")
+                if value:
+                    self.profile["name"] = value.title()
+                    self.save_persistent_memory()
+                return
+
+        for marker in preference_markers:
+            if command.startswith(marker):
+                value = command.replace(marker, "", 1).strip(" .")
+                if value:
+                    prefs = self.profile.get("preferences", [])
+                    prefs.append(value)
+                    self.profile["preferences"] = prefs[-10:]
+                    self.save_persistent_memory()
+                return
 
         for marker in goal_markers:
             if marker in command:
                 value = command.split(marker, 1)[1].strip(" .")
                 if value:
                     self.memory["user_goal"] = value
+                    self.save_persistent_memory()
                 return
 
         for marker in task_markers:
@@ -184,6 +549,7 @@ class JarvisAssistant:
                 value = command.split(marker, 1)[1].strip(" .")
                 if value:
                     self.memory["ongoing_task"] = value
+                    self.save_persistent_memory()
                 return
 
         if command.startswith("remember that "):
@@ -191,6 +557,7 @@ class JarvisAssistant:
             if note:
                 self.memory["notes"].append(note)
                 self.memory["notes"] = self.memory["notes"][-8:]
+                self.save_persistent_memory()
 
     def build_plan(self, objective: str) -> list[str]:
         cleaned = objective.strip()
@@ -200,6 +567,276 @@ class JarvisAssistant:
             "Execute the first milestone and verify results quickly.",
             "Review progress, adjust, and continue to completion.",
         ]
+
+    def parse_datetime_iso(self, value: str | None) -> dt.datetime | None:
+        if not value:
+            return None
+        try:
+            return dt.datetime.fromisoformat(value)
+        except Exception:
+            return None
+
+    def format_due_time(self, due_at: dt.datetime) -> str:
+        now = dt.datetime.now()
+        if due_at.date() == now.date():
+            return due_at.strftime("today at %I:%M %p")
+        if due_at.date() == (now.date() + dt.timedelta(days=1)):
+            return due_at.strftime("tomorrow at %I:%M %p")
+        return due_at.strftime("%Y-%m-%d %I:%M %p")
+
+    def parse_reminder_request(self, command: str) -> tuple[str, dt.datetime] | None:
+        if not command.startswith("remind me to "):
+            return None
+
+        now = dt.datetime.now()
+        payload = command.replace("remind me to ", "", 1).strip()
+        title = payload
+        due_at: dt.datetime | None = None
+
+        relative_match = re.search(r"\s+in\s+(\d+)\s+(minute|minutes|hour|hours|day|days)\s*$", payload)
+        if relative_match:
+            amount = int(relative_match.group(1))
+            unit = relative_match.group(2)
+            if "minute" in unit:
+                due_at = now + dt.timedelta(minutes=amount)
+            elif "hour" in unit:
+                due_at = now + dt.timedelta(hours=amount)
+            else:
+                due_at = now + dt.timedelta(days=amount)
+            title = payload[: relative_match.start()].strip(" ,.")
+
+        tomorrow_match = re.search(r"\s+tomorrow\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", payload)
+        if tomorrow_match and due_at is None:
+            hour = int(tomorrow_match.group(1))
+            minute = int(tomorrow_match.group(2) or "0")
+            meridiem = (tomorrow_match.group(3) or "").lower()
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+            tomorrow = now + dt.timedelta(days=1)
+            due_at = tomorrow.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            title = payload[: tomorrow_match.start()].strip(" ,.")
+
+        at_match = re.search(r"\s+at\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\s*$", payload)
+        if at_match and due_at is None:
+            hour = int(at_match.group(1))
+            minute = int(at_match.group(2) or "0")
+            meridiem = (at_match.group(3) or "").lower()
+            if meridiem == "pm" and hour < 12:
+                hour += 12
+            if meridiem == "am" and hour == 12:
+                hour = 0
+            due_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if due_at <= now:
+                due_at += dt.timedelta(days=1)
+            title = payload[: at_match.start()].strip(" ,.")
+
+        if not title:
+            title = "Untitled reminder"
+
+        if due_at is None:
+            due_at = now + dt.timedelta(minutes=30)
+
+        return title, due_at
+
+    def add_reminder(self, title: str, due_at: dt.datetime) -> dict:
+        reminder = {
+            "id": str(uuid.uuid4())[:8],
+            "title": title,
+            "due_at": due_at.isoformat(timespec="seconds"),
+            "status": "pending",
+            "created_at": dt.datetime.now().isoformat(timespec="seconds"),
+            "last_notified_at": None,
+        }
+        reminders = self.memory.get("reminders", [])
+        reminders.append(reminder)
+        self.memory["reminders"] = reminders[-40:]
+        self.save_persistent_memory()
+        return reminder
+
+    def list_pending_reminders(self) -> list[dict]:
+        reminders = self.memory.get("reminders", [])
+        pending = []
+        for item in reminders:
+            if item.get("status") == "pending":
+                pending.append(item)
+        pending.sort(key=lambda x: x.get("due_at", ""))
+        return pending
+
+    def complete_reminder(self, reminder_id: str) -> bool:
+        reminders = self.memory.get("reminders", [])
+        for item in reminders:
+            if item.get("id") == reminder_id and item.get("status") == "pending":
+                item["status"] = "done"
+                item["completed_at"] = dt.datetime.now().isoformat(timespec="seconds")
+                self.save_persistent_memory()
+                return True
+        return False
+
+    def delete_reminder(self, reminder_id: str) -> bool:
+        reminders = self.memory.get("reminders", [])
+        before = len(reminders)
+        reminders = [item for item in reminders if item.get("id") != reminder_id]
+        self.memory["reminders"] = reminders
+        changed = len(reminders) != before
+        if changed:
+            self.save_persistent_memory()
+        return changed
+
+    def check_due_reminders(self) -> None:
+        now = dt.datetime.now()
+        due_reminders: list[dict] = []
+        reminders = self.memory.get("reminders", [])
+
+        for item in reminders:
+            if item.get("status") != "pending":
+                continue
+
+            due_at = self.parse_datetime_iso(item.get("due_at"))
+            if due_at is None or due_at > now:
+                continue
+
+            last_notified = self.parse_datetime_iso(item.get("last_notified_at"))
+            if last_notified and (now - last_notified).total_seconds() < 300:
+                continue
+
+            item["last_notified_at"] = now.isoformat(timespec="seconds")
+            due_reminders.append(item)
+
+        if due_reminders:
+            self.save_persistent_memory()
+
+        for item in due_reminders:
+            self.speak(f"Reminder due: {item.get('title')}. Say complete reminder {item.get('id')} when done.")
+
+    def start_reminder_worker(self) -> None:
+        if self.reminder_worker is not None and self.reminder_worker.is_alive():
+            return
+        self.reminder_stop_event.clear()
+        self.reminder_worker = threading.Thread(target=self._reminder_worker_loop, daemon=True)
+        self.reminder_worker.start()
+
+    def _reminder_worker_loop(self) -> None:
+        while not self.reminder_stop_event.is_set():
+            self.check_due_reminders()
+            for _ in range(10):
+                if self.reminder_stop_event.is_set():
+                    return
+                time.sleep(1)
+
+    def plan_actions_from_text(self, command: str) -> list[dict]:
+        lowered = command.lower().strip()
+        if not lowered:
+            return []
+
+        chunks = [part.strip() for part in re.split(r"\s+and then\s+|\s+then\s+", lowered) if part.strip()]
+        if not chunks:
+            chunks = [lowered]
+
+        actions: list[dict] = []
+        for chunk in chunks:
+            if chunk.startswith("open "):
+                target = chunk.replace("open ", "", 1).strip()
+                if not target:
+                    continue
+
+                known_sites = {
+                    "google": "https://www.google.com",
+                    "youtube": "https://www.youtube.com",
+                    "github": "https://github.com",
+                }
+
+                if target.startswith("http://") or target.startswith("https://"):
+                    actions.append({"type": "open_website", "url": target})
+                elif target in known_sites:
+                    actions.append({"type": "open_website", "url": known_sites[target]})
+                else:
+                    actions.append({"type": "open_application", "app": target})
+                continue
+
+            if chunk.startswith("search "):
+                query = chunk.replace("search ", "", 1).strip()
+                if query:
+                    actions.append({"type": "search_web", "query": query})
+                continue
+
+            if "list files" in chunk or "show files" in chunk:
+                actions.append({"type": "list_files"})
+                continue
+
+            parsed_reminder = self.parse_reminder_request(chunk)
+            if parsed_reminder is not None:
+                title, due_at = parsed_reminder
+                actions.append({"type": "add_reminder", "title": title, "due_at": due_at.isoformat()})
+
+        return actions
+
+    def execute_action_plan(self, actions: list[dict]) -> bool:
+        if not actions:
+            return False
+
+        for action in actions:
+            action_type = action.get("type")
+
+            if action_type == "open_website":
+                url = action.get("url", "")
+                if not isinstance(url, str) or not url:
+                    continue
+                escaped = url.replace('"', '\\"')
+                self.emit_action(f'open_website("{escaped}")', "Opening website from planned action.")
+                self.open_website(url)
+                self.speak(f"Opened {url}.")
+                continue
+
+            if action_type == "open_application":
+                app = action.get("app", "")
+                if not isinstance(app, str) or not app:
+                    continue
+                escaped = app.replace('"', '\\"')
+                self.emit_action(f'open_application("{escaped}")', "Opening app from planned action.")
+                if self.open_application(app):
+                    self.speak(f"Opened {app}.")
+                else:
+                    self.speak(f"I could not open {app}.")
+                continue
+
+            if action_type == "search_web":
+                query = action.get("query", "")
+                if not isinstance(query, str) or not query:
+                    continue
+                escaped = query.replace('"', '\\"')
+                self.emit_action(f'search_web("{escaped}")', "Searching web from planned action.")
+                self.search_web(query)
+                self.speak(f"Searched for {query}.")
+                continue
+
+            if action_type == "list_files":
+                self.emit_action('list_files(".")', "Listing files from planned action.")
+                files = self.list_files(".")
+                if not files:
+                    self.speak("I could not find files in this folder.")
+                else:
+                    preview = ", ".join(files[:8])
+                    self.speak(f"I found {len(files)} items. First results: {preview}.")
+                continue
+
+            if action_type == "add_reminder":
+                title = action.get("title", "")
+                due_at_raw = action.get("due_at")
+                due_at = self.parse_datetime_iso(str(due_at_raw) if due_at_raw is not None else None)
+                if not isinstance(title, str) or not title or due_at is None:
+                    continue
+                reminder = self.add_reminder(title, due_at)
+                self.emit_action(
+                    f'add_reminder("{title.replace("\"", "\\\"")}", "{due_at.isoformat(timespec="seconds")}")',
+                    "Creating reminder from planned action.",
+                )
+                self.speak(
+                    f"Reminder set for {title}, due {self.format_due_time(due_at)}. ID {reminder.get('id')}."
+                )
+
+        return True
 
     def open_application(self, app_name: str) -> bool:
         app_map = {
@@ -237,18 +874,25 @@ class JarvisAssistant:
         return sorted(item.name for item in base.iterdir())
 
     def listen(self) -> str | None:
-        if not self.use_voice or sr is None:
+        if not self.use_microphone or sr is None or self.recognizer is None or self.microphone is None:
             return None
 
-        recognizer = sr.Recognizer()
         try:
-            with sr.Microphone() as source:
+            with self.microphone as source:
                 print("Listening...")
-                recognizer.adjust_for_ambient_noise(source, duration=0.5)
-                audio = recognizer.listen(source, timeout=6, phrase_time_limit=8)
-            text = recognizer.recognize_google(audio)
+                if not self.microphone_calibrated and self.mic_calibration_seconds > 0:
+                    self.recognizer.adjust_for_ambient_noise(source, duration=self.mic_calibration_seconds)
+                    self.microphone_calibrated = True
+                audio = self.recognizer.listen(
+                    source,
+                    timeout=self.listen_timeout,
+                    phrase_time_limit=self.phrase_time_limit,
+                )
+            text = self.recognizer.recognize_google(audio)
             print(f"You: {text}")
             return text
+        except sr.UnknownValueError:
+            return None
         except sr.WaitTimeoutError:
             return None
         except Exception:
@@ -273,6 +917,55 @@ class JarvisAssistant:
         self.remember_command(command)
         self.update_context_from_command(command)
 
+        if command in {"stop", "stop talking", "quiet", "be quiet", "pause"}:
+            self.interrupt_speech()
+            self.speak("Understood. I will stay quiet.")
+            return True
+
+        if command in {"enable barge in", "enable barge-in"}:
+            self.barge_in_enabled = True
+            self.speak("Barge-in is now enabled.")
+            return True
+
+        if command in {"disable barge in", "disable barge-in"}:
+            self.barge_in_enabled = False
+            self.speak("Barge-in is now disabled.")
+            return True
+
+        if self.is_speaking() and self.barge_in_enabled:
+            self.interrupt_speech()
+
+        if command.startswith(("my name is ", "call me ")):
+            self.speak(f"Great to meet you, {self.display_name()}. I will remember that.")
+            return True
+
+        if command.startswith(("i prefer ", "my preference is ")):
+            self.speak("Got it. I saved your preference.")
+            return True
+
+        if "what is my name" in command or "who am i" in command:
+            if self.profile.get("name"):
+                self.speak(f"You are {self.display_name()}.")
+            else:
+                self.speak("You have not told me your name yet. Say: my name is ...")
+            return True
+
+        if "show my preferences" in command or "what are my preferences" in command:
+            prefs = self.profile.get("preferences", [])
+            if not prefs:
+                self.speak("You have no saved preferences yet.")
+                return True
+            self.speak("Here are your saved preferences.")
+            for idx, pref in enumerate(prefs, start=1):
+                print(f"{idx}. {pref}")
+            return True
+
+        if "forget my name" in command:
+            self.profile["name"] = None
+            self.save_persistent_memory()
+            self.speak("Done. I forgot your name.")
+            return True
+
         if command.startswith(("my goal is ", "i am trying to ", "i'm trying to ", "i want to ")):
             goal = self.memory.get("user_goal")
             if goal:
@@ -290,16 +983,41 @@ class JarvisAssistant:
             return True
 
         if any(word in command for word in ["exit", "quit", "goodbye", "shutdown"]):
+            self.save_persistent_memory()
             self.speak("Shutting down. Talk to you later.")
             return False
 
         if command in {"help", "commands", "what can you do"}:
             self.speak(
-                "I can chat naturally, remember context, plan tasks, and run computer actions. "
-                "Try: time, date, open google, search python automation, list files, plan build my bot, "
+                "I can hold human-like conversations, remember your preferences, help plan goals, "
+                "and run actions on your machine. Try: my name is Alex, I prefer concise answers, "
+                "plan build my bot, remind me to stretch in 30 minutes, execute open google then search local ai, "
                 "llm status, and exit."
             )
             return True
+
+        if command.startswith(("execute ", "do this ", "do this:", "run plan ")):
+            request = (
+                command.replace("do this:", "", 1)
+                .replace("do this ", "", 1)
+                .replace("execute ", "", 1)
+                .replace("run plan ", "", 1)
+                .strip()
+            )
+            actions = self.plan_actions_from_text(request)
+            if not actions:
+                self.speak("I could not build an action plan from that request yet.")
+                return True
+            self.speak("On it. Executing your plan now.")
+            self.execute_action_plan(actions)
+            return True
+
+        if " and then " in command or command.startswith("first "):
+            actions = self.plan_actions_from_text(command)
+            if len(actions) >= 2:
+                self.speak("Understood. I will handle those steps now.")
+                self.execute_action_plan(actions)
+                return True
 
         if "llm status" in command or "model status" in command:
             _, status_text = self.llm_status()
@@ -342,6 +1060,48 @@ class JarvisAssistant:
             self.speak("Here are your recent commands.")
             for idx, item in enumerate(recent, start=1):
                 print(f"{idx}. {item}")
+            return True
+
+        parsed_reminder = self.parse_reminder_request(command)
+        if parsed_reminder is not None:
+            title, due_at = parsed_reminder
+            reminder = self.add_reminder(title, due_at)
+            self.emit_action(
+                f'add_reminder("{title.replace("\"", "\\\"")}", "{due_at.isoformat(timespec="seconds")}")',
+                "Creating reminder.",
+            )
+            self.speak(
+                f"Reminder set for {title}, due {self.format_due_time(due_at)}. "
+                f"Reminder ID {reminder.get('id')}."
+            )
+            return True
+
+        if command in {"show reminders", "list reminders", "my reminders"}:
+            pending = self.list_pending_reminders()
+            if not pending:
+                self.speak("You have no pending reminders.")
+                return True
+            self.speak("Here are your pending reminders.")
+            for item in pending[:15]:
+                due_at = self.parse_datetime_iso(item.get("due_at"))
+                due_text = self.format_due_time(due_at) if due_at else item.get("due_at")
+                print(f"{item.get('id')}: {item.get('title')} -> {due_text}")
+            return True
+
+        if command.startswith("complete reminder "):
+            reminder_id = command.replace("complete reminder ", "", 1).strip()
+            if self.complete_reminder(reminder_id):
+                self.speak(f"Reminder {reminder_id} marked complete.")
+            else:
+                self.speak("I could not find that pending reminder ID.")
+            return True
+
+        if command.startswith("delete reminder "):
+            reminder_id = command.replace("delete reminder ", "", 1).strip()
+            if self.delete_reminder(reminder_id):
+                self.speak(f"Reminder {reminder_id} deleted.")
+            else:
+                self.speak("I could not find that reminder ID.")
             return True
 
         if "time" in command:
@@ -445,9 +1205,9 @@ class JarvisAssistant:
         if any(greet in command for greet in ["hello", "hi", "hey"]):
             current_task = self.memory.get("ongoing_task") or self.memory.get("user_goal")
             if current_task:
-                self.speak(f"Hello. Ready to continue with {current_task}?")
+                self.speak(f"Hey {self.display_name()}. Ready to continue with {current_task}?")
             else:
-                self.speak("Hello. What would you like to work on today?")
+                self.speak(f"Hey {self.display_name()}. What are we working on today?")
             return True
 
         if "how are you" in command:
@@ -473,16 +1233,47 @@ class JarvisAssistant:
         return True
 
 
-def run_self_test(use_voice: bool, llm_client: LocalLLMClient | None = None) -> int:
+def list_microphones() -> int:
+    if sr is None:
+        print("SpeechRecognition is not installed.")
+        return 1
+
+    try:
+        names = sr.Microphone.list_microphone_names()
+    except Exception as ex:
+        print(f"Microphone listing failed: {ex}")
+        return 1
+
+    if not names:
+        print("No microphones detected.")
+        return 1
+
+    print("Available microphones:")
+    for idx, name in enumerate(names):
+        print(f"{idx}: {name}")
+    return 0
+
+
+def run_self_test(
+    use_voice: bool,
+    use_microphone: bool,
+    mic_index: int | None,
+    llm_client: LocalLLMClient | None = None,
+) -> int:
     print("Running Jarvis self-test...")
     print(f"Python: {sys.version.split()[0]}")
     print(f"SpeechRecognition installed: {sr is not None}")
     print(f"pyttsx3 installed: {pyttsx3 is not None}")
+    print(f"Voice output enabled: {use_voice}")
+    print(f"Microphone input enabled: {use_microphone}")
+    print(f"Microphone index: {mic_index if mic_index is not None else 'default'}")
 
-    if use_voice and sr is not None:
+    if use_microphone and sr is not None:
         try:
             names = sr.Microphone.list_microphone_names()
             print(f"Microphones detected: {len(names)}")
+            if mic_index is not None and 0 <= mic_index < len(names):
+                print(f"Selected microphone: {names[mic_index]}")
         except Exception as ex:
             print(f"Microphone check failed: {ex}")
             return 1
@@ -500,36 +1291,80 @@ def run_self_test(use_voice: bool, llm_client: LocalLLMClient | None = None) -> 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Jarvis-style assistant")
     parser.add_argument("--text-only", action="store_true", help="Disable microphone and voice output")
+    parser.add_argument("--keyboard-input", action="store_true", help="Type commands while still allowing voice output")
+    parser.add_argument("--list-mics", action="store_true", help="List available microphones and exit")
+    parser.add_argument("--mic-index", type=int, default=None, help="Microphone device index to use")
     parser.add_argument("--self-test", action="store_true", help="Run environment checks and exit")
     parser.add_argument("--no-llm", action="store_true", help="Disable local Ollama conversation fallback")
     parser.add_argument("--model", default="llama3.2:1b", help="Ollama model name to use for local chat")
     parser.add_argument("--ollama-url", default="http://127.0.0.1:11434", help="Ollama server URL")
-    parser.add_argument("--llm-timeout", type=int, default=120, help="Timeout in seconds for local LLM responses")
+    parser.add_argument("--llm-timeout", type=int, default=60, help="Timeout in seconds for local LLM responses")
+    parser.add_argument("--llm-max-tokens", type=int, default=96, help="Max tokens generated by local LLM")
+    parser.add_argument("--memory-file", default=".jarvis_memory.json", help="Path to persistent Jarvis memory file")
+    parser.add_argument("--history-turns", type=int, default=12, help="Number of recent conversation turns to retain")
+    parser.add_argument("--listen-timeout", type=float, default=3.0, help="Seconds to wait for speech before retry")
+    parser.add_argument("--phrase-time-limit", type=float, default=6.0, help="Max seconds for each spoken command")
+    parser.add_argument(
+        "--mic-calibration-seconds",
+        type=float,
+        default=0.2,
+        help="One-time microphone ambient calibration duration",
+    )
     args = parser.parse_args()
 
     use_voice = not args.text_only
+    use_microphone = use_voice and not args.keyboard_input
+
+    if args.list_mics:
+        return list_microphones()
+
     llm_client = None
     if not args.no_llm:
         llm_client = LocalLLMClient(
             base_url=args.ollama_url,
             model=args.model,
             timeout_seconds=max(args.llm_timeout, 10),
+            max_tokens=max(args.llm_max_tokens, 32),
         )
 
     if args.self_test:
-        return run_self_test(use_voice=use_voice, llm_client=llm_client)
+        return run_self_test(
+            use_voice=use_voice,
+            use_microphone=use_microphone,
+            mic_index=args.mic_index,
+            llm_client=llm_client,
+        )
 
-    assistant = JarvisAssistant(use_voice=use_voice, llm_client=llm_client)
-    assistant.speak("Jarvis online. Say help for commands. Say exit to stop.")
+    assistant = JarvisAssistant(
+        use_voice=use_voice,
+        use_microphone=use_microphone,
+        llm_client=llm_client,
+        mic_index=args.mic_index,
+        memory_file=args.memory_file,
+        max_history_turns=max(args.history_turns, 6),
+        listen_timeout=args.listen_timeout,
+        phrase_time_limit=args.phrase_time_limit,
+        mic_calibration_seconds=args.mic_calibration_seconds,
+    )
+    assistant.speak(f"Jarvis online. Good to see you, {assistant.display_name()}. Say help for commands.")
+    assistant.check_due_reminders()
+
+    if use_voice and args.keyboard_input:
+        assistant.speak("Keyboard input mode enabled. Type commands, and I will reply out loud.")
+    elif use_voice and not assistant.use_microphone:
+        assistant.speak("Microphone is unavailable. Switching to keyboard input mode.")
 
     if llm_client is not None:
         llm_ready, llm_message = assistant.llm_status()
         assistant.speak(llm_message)
         if not llm_ready:
             assistant.speak(f'If needed, run: ollama pull {args.model}')
+        else:
+            # Warm the model in the background to reduce first-response latency.
+            threading.Thread(target=llm_client.prewarm, daemon=True).start()
 
     while True:
-        if use_voice:
+        if assistant.use_microphone:
             raw = assistant.listen()
             if not raw:
                 continue
@@ -538,6 +1373,7 @@ def main() -> int:
         command = assistant.normalize_command(raw)
         keep_running = assistant.handle_command(command)
         if not keep_running:
+            assistant.shutdown()
             return 0
 
 
