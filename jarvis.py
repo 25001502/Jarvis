@@ -25,6 +25,13 @@ try:
 except Exception:
     sr = None
 
+try:
+    import pyaudio  # type: ignore  # noqa: F401
+
+    HAS_PYAUDIO = True
+except Exception:
+    HAS_PYAUDIO = False
+
 
 class LocalLLMClient:
     def __init__(
@@ -1263,6 +1270,7 @@ def run_self_test(
     print("Running Jarvis self-test...")
     print(f"Python: {sys.version.split()[0]}")
     print(f"SpeechRecognition installed: {sr is not None}")
+    print(f"PyAudio installed: {HAS_PYAUDIO}")
     print(f"pyttsx3 installed: {pyttsx3 is not None}")
     print(f"Voice output enabled: {use_voice}")
     print(f"Microphone input enabled: {use_microphone}")
@@ -1314,6 +1322,17 @@ def main() -> int:
 
     use_voice = not args.text_only
     use_microphone = use_voice and not args.keyboard_input
+
+    if use_microphone and sr is None:
+        print("Microphone mode requires SpeechRecognition. Install dependencies from requirements.txt.")
+        return 1
+
+    if use_microphone and not HAS_PYAUDIO:
+        print("Microphone mode requires PyAudio in the current Python environment.")
+        print("Use the project Python 3.12 virtual environment for full voice conversation:")
+        print("  .\\.venv\\Scripts\\python.exe jarvis.py")
+        print("Or switch to --keyboard-input / --text-only if you cannot change environments.")
+        return 1
 
     if args.list_mics:
         return list_microphones()
