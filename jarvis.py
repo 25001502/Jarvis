@@ -5,6 +5,7 @@ import platform
 from pathlib import Path
 import re
 import queue
+import shutil
 import subprocess
 import sys
 import threading
@@ -31,6 +32,21 @@ try:
     HAS_PYAUDIO = True
 except Exception:
     HAS_PYAUDIO = False
+
+try:
+    import pyautogui
+except Exception:
+    pyautogui = None
+
+try:
+    from PIL import ImageGrab
+except Exception:
+    ImageGrab = None
+
+try:
+    import pytesseract
+except Exception:
+    pytesseract = None
 
 
 class LocalLLMClient:
@@ -206,6 +222,7 @@ class JarvisAssistant:
             "notes": [],
             "previous_commands": [],
             "reminders": [],
+            "actuators": {},
         }
         self.profile = {
             "name": None,
@@ -219,7 +236,8 @@ class JarvisAssistant:
         self.tts_speaking_event = threading.Event()
         self.reminder_worker: threading.Thread | None = None
         self.reminder_stop_event = threading.Event()
-        self.barge_in_enabled = True
+        # Default off to avoid the mic interrupting Jarvis with room/speaker audio.
+        self.barge_in_enabled = False
 
         if self.recognizer is not None:
             try:
@@ -242,6 +260,26 @@ class JarvisAssistant:
 
         self.load_persistent_memory()
         self.start_reminder_worker()
+
+    def _restore_tts_engine(self) -> bool:
+        if not self.use_voice or pyttsx3 is None:
+            return False
+
+        try:
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 185)
+            engine.setProperty("volume", 1.0)
+            self.tts_engine = engine
+            self.start_tts_worker()
+            return True
+        except Exception:
+            self.tts_engine = None
+            return False
+
+    def _notify_voice_unavailable_once(self) -> None:
+        if self.use_voice and not self.voice_warning_printed:
+            print("Jarvis: Voice output is unavailable. Run with --text-only or fix Windows TTS settings.")
+            self.voice_warning_printed = True
 
     def load_persistent_memory(self) -> None:
         if not self.memory_file.exists():
@@ -272,6 +310,28 @@ class JarvisAssistant:
                 valid_reminders.append(item)
             self.memory["reminders"] = valid_reminders[-40:]
 
+            loaded_actuators = saved_memory.get("actuators", {})
+            valid_actuators: dict[str, dict] = {}
+            if isinstance(loaded_actuators, dict):
+                for raw_name, payload in loaded_actuators.items():
+                    if not isinstance(raw_name, str):
+                        continue
+                    name = self.normalize_actuator_name(raw_name)
+                    if not name:
+                        continue
+
+                    state = "off"
+                    if isinstance(payload, dict):
+                        raw_state = str(payload.get("state", "off")).lower()
+                        state = "on" if raw_state == "on" else "off"
+
+                    valid_actuators[name] = {
+                        "state": state,
+                        "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+                    }
+
+            self.memory["actuators"] = valid_actuators
+
         if isinstance(saved_profile, dict):
             self.profile["name"] = saved_profile.get("name")
             self.profile["preferences"] = list(saved_profile.get("preferences", []))[-10:]
@@ -295,6 +355,7 @@ class JarvisAssistant:
                 "ongoing_task": self.memory.get("ongoing_task"),
                 "notes": self.memory.get("notes", [])[-8:],
                 "reminders": self.memory.get("reminders", [])[-40:],
+                "actuators": self.memory.get("actuators", {}),
             },
             "profile": {
                 "name": self.profile.get("name"),
@@ -362,7 +423,10 @@ class JarvisAssistant:
             if text is None:
                 break
 
-            if self.tts_engine is None:
+            if self.tts_engine is None and not self._restore_tts_engine():
+                if self.use_voice and self._speak_with_windows_fallback(text):
+                    continue
+                self._notify_voice_unavailable_once()
                 continue
 
             self.tts_speaking_event.set()
@@ -371,6 +435,7 @@ class JarvisAssistant:
                 self.tts_engine.runAndWait()
             except Exception:
                 self.tts_engine = None
+                self._restore_tts_engine()
             finally:
                 self.tts_speaking_event.clear()
 
@@ -407,37 +472,45 @@ class JarvisAssistant:
             f"$s.Speak('{escaped}')"
         )
         try:
-            subprocess.run(
+            result = subprocess.run(
                 ["powershell", "-NoProfile", "-Command", ps_script],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 timeout=20,
                 check=False,
             )
-            return True
+            return result.returncode == 0
         except Exception:
             return False
 
     def speak(self, text: str) -> None:
         print(f"Jarvis: {text}")
-        if self.use_voice and self.tts_engine is not None:
-            if self.tts_worker is not None and self.tts_worker.is_alive():
+        if not self.use_voice:
+            return
+
+        worker_alive = self.tts_worker is not None and self.tts_worker.is_alive()
+        if worker_alive:
+            if self.tts_engine is not None or self._restore_tts_engine():
                 self.speech_queue.put_nowait(text)
                 return
 
+        if self.tts_engine is not None:
             try:
                 self.tts_engine.say(text)
                 self.tts_engine.runAndWait()
                 return
             except Exception:
                 self.tts_engine = None
+                if self._restore_tts_engine():
+                    worker_alive = self.tts_worker is not None and self.tts_worker.is_alive()
+                    if worker_alive:
+                        self.speech_queue.put_nowait(text)
+                        return
 
-        if self.use_voice and self._speak_with_windows_fallback(text):
+        if self._speak_with_windows_fallback(text):
             return
 
-        if self.use_voice and not self.voice_warning_printed:
-            print("Jarvis: Voice output is unavailable. Run with --text-only or fix Windows TTS settings.")
-            self.voice_warning_printed = True
+        self._notify_voice_unavailable_once()
 
     def emit_action(self, action_call: str, explanation: str) -> None:
         print("ACTION:")
@@ -574,6 +647,194 @@ class JarvisAssistant:
             "Execute the first milestone and verify results quickly.",
             "Review progress, adjust, and continue to completion.",
         ]
+
+    def normalize_actuator_name(self, name: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9_\-\s]", "", name.lower()).strip()
+        cleaned = re.sub(r"\s+", "_", cleaned)
+        return cleaned[:40]
+
+    def humanize_actuator_name(self, name: str) -> str:
+        return name.replace("_", " ")
+
+    def actuator_store(self) -> dict:
+        store = self.memory.get("actuators")
+        if not isinstance(store, dict):
+            store = {}
+            self.memory["actuators"] = store
+        return store
+
+    def register_actuator(self, raw_name: str) -> tuple[bool, str, str | None]:
+        name = self.normalize_actuator_name(raw_name)
+        if not name:
+            return False, "Please provide a valid actuator name.", None
+
+        actuators = self.actuator_store()
+        if name in actuators:
+            return True, f"Actuator {self.humanize_actuator_name(name)} is already registered.", name
+
+        actuators[name] = {
+            "state": "off",
+            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+        }
+        self.save_persistent_memory()
+        return True, f"Actuator {self.humanize_actuator_name(name)} registered and set to off.", name
+
+    def set_actuator_state(self, raw_name: str, state: str) -> tuple[bool, str, str | None]:
+        name = self.normalize_actuator_name(raw_name)
+        desired = "on" if state.lower() == "on" else "off"
+        if not name:
+            return False, "Please provide a valid actuator name.", None
+
+        actuators = self.actuator_store()
+        if name not in actuators:
+            actuators[name] = {
+                "state": "off",
+                "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
+            }
+
+        actuators[name]["state"] = desired
+        actuators[name]["updated_at"] = dt.datetime.now().isoformat(timespec="seconds")
+        self.save_persistent_memory()
+        return True, f"Actuator {self.humanize_actuator_name(name)} is now {desired}.", name
+
+    def toggle_actuator(self, raw_name: str) -> tuple[bool, str, str | None]:
+        name = self.normalize_actuator_name(raw_name)
+        if not name:
+            return False, "Please provide a valid actuator name.", None
+
+        actuators = self.actuator_store()
+        current = "off"
+        if name in actuators:
+            current = "on" if actuators[name].get("state") == "on" else "off"
+
+        next_state = "off" if current == "on" else "on"
+        return self.set_actuator_state(name, next_state)
+
+    def list_actuator_statuses(self) -> list[str]:
+        actuators = self.actuator_store()
+        if not actuators:
+            return []
+
+        lines = []
+        for name in sorted(actuators.keys()):
+            state = "on" if actuators.get(name, {}).get("state") == "on" else "off"
+            lines.append(f"{self.humanize_actuator_name(name)}: {state}")
+        return lines
+
+    def get_actuator_status(self, raw_name: str) -> tuple[bool, str, str | None]:
+        name = self.normalize_actuator_name(raw_name)
+        if not name:
+            return False, "Please provide a valid actuator name.", None
+
+        actuators = self.actuator_store()
+        if name not in actuators:
+            return False, f"Actuator {self.humanize_actuator_name(name)} is not registered.", name
+
+        state = "on" if actuators[name].get("state") == "on" else "off"
+        return True, f"Actuator {self.humanize_actuator_name(name)} is {state}.", name
+
+    def write_text_to_active_window(
+        self,
+        text: str,
+        delay_seconds: float = 1.0,
+        typing_interval: float = 0.01,
+    ) -> tuple[bool, str]:
+        if pyautogui is None:
+            return False, "Desktop typing control is unavailable. Install pyautogui."
+
+        if not text.strip():
+            return False, "I need some text to write."
+
+        try:
+            if delay_seconds > 0:
+                time.sleep(delay_seconds)
+            pyautogui.write(text, interval=max(typing_interval, 0.0))
+            return True, "Done. I typed the requested text."
+        except Exception as ex:
+            return False, f"I could not type text: {ex}"
+
+    def press_keyboard_key(self, key_name: str) -> tuple[bool, str]:
+        if pyautogui is None:
+            return False, "Keyboard control is unavailable. Install pyautogui."
+
+        key = key_name.strip().lower().replace(" ", "")
+        alias = {
+            "return": "enter",
+            "esc": "escape",
+            "spacebar": "space",
+            "pgup": "pageup",
+            "pgdn": "pagedown",
+        }
+        key = alias.get(key, key)
+        if not key:
+            return False, "Please provide a key to press."
+
+        try:
+            pyautogui.press(key)
+            return True, f"Pressed {key}."
+        except Exception as ex:
+            return False, f"I could not press that key: {ex}"
+
+    def trigger_hotkey(self, keys: list[str]) -> tuple[bool, str]:
+        if pyautogui is None:
+            return False, "Hotkey control is unavailable. Install pyautogui."
+
+        normalized = [key.strip().lower().replace(" ", "") for key in keys if key.strip()]
+        if len(normalized) < 2:
+            return False, "Provide at least two keys, for example: hotkey ctrl+s"
+
+        try:
+            pyautogui.hotkey(*normalized)
+            return True, f"Sent hotkey {'+'.join(normalized)}."
+        except Exception as ex:
+            return False, f"I could not trigger that hotkey: {ex}"
+
+    def capture_screen(self) -> tuple[bool, str, Path | None]:
+        if ImageGrab is None:
+            return False, "Screen capture is unavailable. Install Pillow.", None
+
+        captures_dir = Path("captures")
+        captures_dir.mkdir(parents=True, exist_ok=True)
+        file_path = captures_dir / f"screen_{dt.datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+
+        try:
+            try:
+                image = ImageGrab.grab(all_screens=True)
+            except TypeError:
+                image = ImageGrab.grab()
+            image.save(file_path)
+            resolved = file_path.resolve()
+            return True, f"Captured your screen to {resolved}.", resolved
+        except Exception as ex:
+            return False, f"I could not capture the screen: {ex}", None
+
+    def read_screen_text(self) -> tuple[bool, str]:
+        if ImageGrab is None:
+            return False, "Screen reading is unavailable. Install Pillow first."
+        if pytesseract is None:
+            return False, "Screen OCR needs pytesseract plus the Tesseract OCR app installed on Windows."
+        if shutil.which("tesseract") is None:
+            return False, "Screen OCR needs Tesseract installed and available in PATH."
+
+        try:
+            try:
+                image = ImageGrab.grab(all_screens=True)
+            except TypeError:
+                image = ImageGrab.grab()
+            raw_text = pytesseract.image_to_string(image)
+        except Exception as ex:
+            return False, f"I could not read screen text: {ex}"
+
+        text = raw_text.strip()
+        if not text:
+            return True, "I checked the screen but did not detect readable text."
+
+        print("SCREEN TEXT:")
+        print(text)
+        preview = " ".join(text.split())
+        if len(preview) > 220:
+            preview = preview[:220].rstrip() + "..."
+        return True, f"I read this on screen: {preview}"
 
     def parse_datetime_iso(self, value: str | None) -> dt.datetime | None:
         if not value:
@@ -917,9 +1178,17 @@ class JarvisAssistant:
             cmd = cmd[len(self.wake_word) :].strip(" ,")
         return cmd
 
-    def handle_command(self, command: str) -> bool:
+    def strip_wake_word_preserve_case(self, raw: str) -> str:
+        cmd = raw.strip()
+        if cmd.lower().startswith(self.wake_word):
+            cmd = cmd[len(self.wake_word) :].strip(" ,")
+        return cmd
+
+    def handle_command(self, command: str, raw_command: str | None = None) -> bool:
         if not command:
             return True
+
+        raw_text_command = self.strip_wake_word_preserve_case(raw_command) if raw_command else command
 
         self.remember_command(command)
         self.update_context_from_command(command)
@@ -941,6 +1210,65 @@ class JarvisAssistant:
 
         if self.is_speaking() and self.barge_in_enabled:
             self.interrupt_speech()
+
+        if command in {"see screen", "see my screen", "capture screen", "screenshot", "take screenshot"}:
+            ok, message, capture_path = self.capture_screen()
+            if ok and capture_path is not None:
+                escaped_path = str(capture_path).replace("\\", "\\\\").replace('"', '\\"')
+                self.emit_action(
+                    f'capture_screen("{escaped_path}")',
+                    "Capturing current screen from the desktop.",
+                )
+            self.speak(message)
+            return True
+
+        if command in {"read screen", "see screen text", "read my screen", "what is on my screen"}:
+            ok, message = self.read_screen_text()
+            self.speak(message)
+            return True
+
+        if command.startswith(("write ", "type ")):
+            match = re.match(r"^(?:write|type)\s+(.+)$", raw_text_command, flags=re.IGNORECASE)
+            text_to_write = match.group(1).strip() if match else command.split(" ", 1)[1].strip()
+            if not text_to_write:
+                self.speak("Tell me what to write.")
+                return True
+
+            print("Jarvis: Focus your target app now. Typing in one second.")
+            ok, message = self.write_text_to_active_window(text_to_write, delay_seconds=1.0)
+            if ok:
+                escaped_text = text_to_write.replace("\\", "\\\\").replace('"', '\\"')
+                self.emit_action(
+                    f'write_text("{escaped_text}")',
+                    "Typing text into the active desktop window.",
+                )
+            self.speak(message)
+            return True
+
+        if command.startswith("press "):
+            key_name = command.replace("press ", "", 1).strip()
+            ok, message = self.press_keyboard_key(key_name)
+            if ok:
+                escaped_key = key_name.replace("\\", "\\\\").replace('"', '\\"')
+                self.emit_action(
+                    f'press_key("{escaped_key}")',
+                    "Pressing keyboard key on the active window.",
+                )
+            self.speak(message)
+            return True
+
+        if command.startswith("hotkey "):
+            combo = command.replace("hotkey ", "", 1).strip()
+            keys = [part for part in re.split(r"\s*\+\s*", combo) if part]
+            ok, message = self.trigger_hotkey(keys)
+            if ok:
+                escaped_combo = "+".join(keys).replace("\\", "\\\\").replace('"', '\\"')
+                self.emit_action(
+                    f'hotkey("{escaped_combo}")',
+                    "Sending desktop hotkey combination.",
+                )
+            self.speak(message)
+            return True
 
         if command.startswith(("my name is ", "call me ")):
             self.speak(f"Great to meet you, {self.display_name()}. I will remember that.")
@@ -999,8 +1327,91 @@ class JarvisAssistant:
                 "I can hold human-like conversations, remember your preferences, help plan goals, "
                 "and run actions on your machine. Try: my name is Alex, I prefer concise answers, "
                 "plan build my bot, remind me to stretch in 30 minutes, execute open google then search local ai, "
+                "see screen, read screen, write Hello world, hotkey ctrl+s, "
+                "register actuator pump, turn on pump, actuator status pump, "
                 "llm status, and exit."
             )
+            return True
+
+        if command in {"actuators", "list actuators", "show actuators", "actuator status"}:
+            statuses = self.list_actuator_statuses()
+            if not statuses:
+                self.speak("No actuators registered yet. Say: register actuator pump.")
+                return True
+            self.speak("Here are your actuator states.")
+            for line in statuses:
+                print(line)
+            return True
+
+        if command.startswith("register actuator "):
+            actuator_name = command.replace("register actuator ", "", 1).strip()
+            ok, message, canonical_name = self.register_actuator(actuator_name)
+            if ok and canonical_name is not None:
+                self.emit_action(
+                    f'register_actuator("{canonical_name}")',
+                    "Registering actuator in local control map.",
+                )
+            self.speak(message)
+            return True
+
+        actuator_action = re.match(r"^actuator\s+(.+?)\s+(on|off|toggle|status)$", command)
+        if actuator_action:
+            actuator_name = actuator_action.group(1).strip()
+            action = actuator_action.group(2)
+            if action == "status":
+                ok, message, canonical_name = self.get_actuator_status(actuator_name)
+                if ok and canonical_name is not None:
+                    self.emit_action(
+                        f'get_actuator_status("{canonical_name}")',
+                        "Querying actuator state.",
+                    )
+                self.speak(message)
+                return True
+
+            if action == "toggle":
+                ok, message, canonical_name = self.toggle_actuator(actuator_name)
+                if ok and canonical_name is not None:
+                    state = self.actuator_store().get(canonical_name, {}).get("state", "off")
+                    self.emit_action(
+                        f'set_actuator_state("{canonical_name}", "{state}")',
+                        "Toggling actuator state.",
+                    )
+                self.speak(message)
+                return True
+
+            ok, message, canonical_name = self.set_actuator_state(actuator_name, action)
+            if ok and canonical_name is not None:
+                self.emit_action(
+                    f'set_actuator_state("{canonical_name}", "{action}")',
+                    "Setting actuator state.",
+                )
+            self.speak(message)
+            return True
+
+        turn_action = re.match(r"^turn\s+(on|off)\s+(.+)$", command)
+        if turn_action:
+            state = turn_action.group(1)
+            actuator_name = turn_action.group(2).strip()
+            ok, message, canonical_name = self.set_actuator_state(actuator_name, state)
+            if ok and canonical_name is not None:
+                self.emit_action(
+                    f'set_actuator_state("{canonical_name}", "{state}")',
+                    "Setting actuator state.",
+                )
+            self.speak(message)
+            return True
+
+        toggle_action = re.match(r"^toggle\s+(.+)$", command)
+        if toggle_action:
+            actuator_name = toggle_action.group(1).strip()
+            ok, message, canonical_name = self.toggle_actuator(actuator_name)
+            if ok and canonical_name is not None:
+                state = self.actuator_store().get(canonical_name, {}).get("state", "off")
+                self.emit_action(
+                    f'set_actuator_state("{canonical_name}", "{state}")',
+                    "Toggling actuator state.",
+                )
+            self.speak(message)
             return True
 
         if command.startswith(("execute ", "do this ", "do this:", "run plan ")):
@@ -1390,7 +1801,7 @@ def main() -> int:
         else:
             raw = assistant.get_text_input()
         command = assistant.normalize_command(raw)
-        keep_running = assistant.handle_command(command)
+        keep_running = assistant.handle_command(command, raw_command=raw)
         if not keep_running:
             assistant.shutdown()
             return 0
