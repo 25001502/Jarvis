@@ -1,4 +1,5 @@
 import argparse
+import ast
 import datetime as dt
 import json
 import platform
@@ -399,24 +400,36 @@ class JarvisAssistant:
             self.speech_queue.put_nowait(None)
         self.reminder_stop_event.set()
 
-    def _speak_with_windows_fallback(self, text: str) -> bool:
+    def _speak_with_system_fallback(self, text: str) -> bool:
         escaped = text.replace("'", "''")
-        ps_script = (
-            "Add-Type -AssemblyName System.Speech; "
-            "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
-            f"$s.Speak('{escaped}')"
-        )
-        try:
-            subprocess.run(
-                ["powershell", "-NoProfile", "-Command", ps_script],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                timeout=20,
-                check=False,
+        system_name = platform.system().lower()
+
+        if "windows" in system_name:
+            ps_script = (
+                "Add-Type -AssemblyName System.Speech; "
+                "$s = New-Object System.Speech.Synthesis.SpeechSynthesizer; "
+                f"$s.Speak('{escaped}')"
             )
-            return True
-        except Exception:
-            return False
+            commands = [["powershell", "-NoProfile", "-Command", ps_script]]
+        elif "darwin" in system_name:
+            commands = [["say", text]]
+        else:
+            commands = [["spd-say", text], ["espeak", text]]
+
+        for cmd in commands:
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=20,
+                    check=False,
+                )
+                if result.returncode == 0:
+                    return True
+            except Exception:
+                continue
+        return False
 
     def speak(self, text: str) -> None:
         print(f"Jarvis: {text}")
@@ -432,11 +445,11 @@ class JarvisAssistant:
             except Exception:
                 self.tts_engine = None
 
-        if self.use_voice and self._speak_with_windows_fallback(text):
+        if self.use_voice and self._speak_with_system_fallback(text):
             return
 
         if self.use_voice and not self.voice_warning_printed:
-            print("Jarvis: Voice output is unavailable. Run with --text-only or fix Windows TTS settings.")
+            print("Jarvis: Voice output is unavailable. Install/configure a local TTS engine for your OS.")
             self.voice_warning_printed = True
 
     def emit_action(self, action_call: str, explanation: str) -> None:
@@ -575,6 +588,47 @@ class JarvisAssistant:
             "Review progress, adjust, and continue to completion.",
         ]
 
+    def evaluate_expression(self, expression: str) -> float | None:
+        if not expression or len(expression) > 120:
+            return None
+        if not re.fullmatch(r"[0-9\.\+\-\*\/\(\)\s%]+", expression):
+            return None
+
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Mod,
+            ast.USub,
+            ast.UAdd,
+            ast.Constant,
+            ast.Load,
+        )
+
+        try:
+            tree = ast.parse(expression, mode="eval")
+        except Exception:
+            return None
+
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                return None
+            if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+                return None
+
+        try:
+            result = eval(compile(tree, "<jarvis-calc>", "eval"), {"__builtins__": {}}, {})
+        except Exception:
+            return None
+
+        if not isinstance(result, (int, float)):
+            return None
+        return float(result)
+
     def parse_datetime_iso(self, value: str | None) -> dt.datetime | None:
         if not value:
             return None
@@ -600,11 +654,16 @@ class JarvisAssistant:
         title = payload
         due_at: dt.datetime | None = None
 
-        relative_match = re.search(r"\s+in\s+(\d+)\s+(minute|minutes|hour|hours|day|days)\s*$", payload)
+        relative_match = re.search(
+            r"\s+in\s+(\d+)\s+(second|seconds|minute|minutes|hour|hours|day|days)\s*$",
+            payload,
+        )
         if relative_match:
             amount = int(relative_match.group(1))
             unit = relative_match.group(2)
-            if "minute" in unit:
+            if "second" in unit:
+                due_at = now + dt.timedelta(seconds=amount)
+            elif "minute" in unit:
                 due_at = now + dt.timedelta(minutes=amount)
             elif "hour" in unit:
                 due_at = now + dt.timedelta(hours=amount)
@@ -835,8 +894,10 @@ class JarvisAssistant:
                 if not isinstance(title, str) or not title or due_at is None:
                     continue
                 reminder = self.add_reminder(title, due_at)
+                escaped_title = title.replace('"', '\\"')
+                due_at_text = due_at.isoformat(timespec="seconds")
                 self.emit_action(
-                    f'add_reminder("{title.replace("\"", "\\\"")}", "{due_at.isoformat(timespec="seconds")}")',
+                    f'add_reminder("{escaped_title}", "{due_at_text}")',
                     "Creating reminder from planned action.",
                 )
                 self.speak(
@@ -1073,8 +1134,10 @@ class JarvisAssistant:
         if parsed_reminder is not None:
             title, due_at = parsed_reminder
             reminder = self.add_reminder(title, due_at)
+            escaped_title = title.replace('"', '\\"')
+            due_at_text = due_at.isoformat(timespec="seconds")
             self.emit_action(
-                f'add_reminder("{title.replace("\"", "\\\"")}", "{due_at.isoformat(timespec="seconds")}")',
+                f'add_reminder("{escaped_title}", "{due_at_text}")',
                 "Creating reminder.",
             )
             self.speak(
@@ -1119,6 +1182,25 @@ class JarvisAssistant:
         if "date" in command:
             today = dt.datetime.now().strftime("%A, %B %d, %Y")
             self.speak(f"Today is {today}.")
+            return True
+
+        if command.startswith("calculate ") or command.startswith("what is "):
+            expression = command.replace("calculate ", "", 1)
+            if command.startswith("what is "):
+                expression = command.replace("what is ", "", 1).strip().rstrip("?")
+            value = self.evaluate_expression(expression.strip())
+            if value is None:
+                if command.startswith("calculate "):
+                    self.speak("I could not parse that calculation. Try: calculate (24*7)-5.")
+                    return True
+            else:
+                if value.is_integer():
+                    self.speak(f"The result is {int(value)}.")
+                else:
+                    self.speak(f"The result is {round(value, 6)}.")
+                return True
+        if command.startswith("calculate "):
+            self.speak("I could not parse that calculation. Try: calculate (24*7)-5.")
             return True
 
         if "open youtube" in command:
@@ -1298,7 +1380,11 @@ def run_self_test(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Local Jarvis-style assistant")
-    parser.add_argument("--text-only", action="store_true", help="Disable microphone and voice output")
+    parser.add_argument(
+        "--text-only",
+        action="store_true",
+        help="Disable microphone input (voice output remains enabled)",
+    )
     parser.add_argument("--keyboard-input", action="store_true", help="Type commands while still allowing voice output")
     parser.add_argument("--list-mics", action="store_true", help="List available microphones and exit")
     parser.add_argument("--mic-index", type=int, default=None, help="Microphone device index to use")
@@ -1320,8 +1406,24 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    use_voice = not args.text_only
-    use_microphone = use_voice and not args.keyboard_input
+    use_voice = True
+    use_microphone = not args.text_only and not args.keyboard_input
+
+    if args.self_test:
+        llm_client = None
+        if not args.no_llm:
+            llm_client = LocalLLMClient(
+                base_url=args.ollama_url,
+                model=args.model,
+                timeout_seconds=max(args.llm_timeout, 10),
+                max_tokens=max(args.llm_max_tokens, 32),
+            )
+        return run_self_test(
+            use_voice=use_voice,
+            use_microphone=use_microphone,
+            mic_index=args.mic_index,
+            llm_client=llm_client,
+        )
 
     if use_microphone and sr is None:
         print("Microphone mode requires SpeechRecognition. Install dependencies from requirements.txt.")
@@ -1344,14 +1446,6 @@ def main() -> int:
             model=args.model,
             timeout_seconds=max(args.llm_timeout, 10),
             max_tokens=max(args.llm_max_tokens, 32),
-        )
-
-    if args.self_test:
-        return run_self_test(
-            use_voice=use_voice,
-            use_microphone=use_microphone,
-            mic_index=args.mic_index,
-            llm_client=llm_client,
         )
 
     assistant = JarvisAssistant(
