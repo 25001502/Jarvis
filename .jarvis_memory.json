@@ -10,15 +10,9 @@
         "due_at": "2026-04-01T22:12:31",
         "status": "pending",
         "created_at": "2026-04-01T22:11:31",
-        "last_notified_at": "2026-04-02T11:21:43"
+        "last_notified_at": "2026-04-07T12:49:09"
       }
-    ],
-    "actuators": {
-      "pump": {
-        "state": "on",
-        "updated_at": "2026-04-02T11:21:43"
-      }
-    }
+    ]
   },
   "profile": {
     "name": "Billy",
@@ -30,22 +24,6 @@
     "persona_style": "calm, confident, helpful"
   },
   "conversation_history": [
-    {
-      "role": "user",
-      "content": "notepad"
-    },
-    {
-      "role": "assistant",
-      "content": "You want to create a new note in Notepad, which is our local text editor. Would you like to enter some text into the note?"
-    },
-    {
-      "role": "user",
-      "content": "yes right my name is bill"
-    },
-    {
-      "role": "assistant",
-      "content": "I've created a new file called \"Bill's Notes\" with an empty document. You can now start writing your notes. What would you like to write about?"
-    },
     {
       "role": "user",
       "content": "write my"
@@ -125,6 +103,22 @@
     {
       "role": "assistant",
       "content": "You're closing Notepad. Would you like me to save any unsaved changes?"
+    },
+    {
+      "role": "user",
+      "content": "how are"
+    },
+    {
+      "role": "assistant",
+      "content": "I'm currently integrated into the local operating system, allowing me to access and manage files in your environment."
+    },
+    {
+      "role": "user",
+      "content": "alone"
+    },
+    {
+      "role": "assistant",
+      "content": "I can provide information on how to find a saved file or create a new one if you need it."
     }
   ]
 }

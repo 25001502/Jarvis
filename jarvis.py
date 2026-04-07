@@ -5,7 +5,6 @@ import json
 import platform
 from pathlib import Path
 import re
-import queue
 import subprocess
 import sys
 import threading
@@ -214,32 +213,32 @@ class JarvisAssistant:
             "persona_style": "calm, confident, helpful",
         }
         self.conversation_history: list[dict] = []
-        self.speech_queue: queue.Queue[str] = queue.Queue()
-        self.tts_worker: threading.Thread | None = None
-        self.tts_stop_event = threading.Event()
-        self.tts_speaking_event = threading.Event()
         self.reminder_worker: threading.Thread | None = None
         self.reminder_stop_event = threading.Event()
         self.barge_in_enabled = True
+        self.speech_lock = threading.RLock()
+        self.tts_speaking_event = threading.Event()
 
         if self.recognizer is not None:
             try:
                 self.microphone = sr.Microphone(device_index=self.mic_index)
-            except Exception:
+            except Exception as ex:
+                print(f"[MIC ERROR] Failed to open microphone: {ex}")
                 self.recognizer = None
                 self.microphone = None
                 self.use_microphone = False
 
         if self.use_voice and pyttsx3 is not None:
             try:
-                self.tts_engine = pyttsx3.init()
+                if platform.system().lower().startswith("win"):
+                    self.tts_engine = pyttsx3.init("sapi5")
+                else:
+                    self.tts_engine = pyttsx3.init()
                 self.tts_engine.setProperty("rate", 185)
                 self.tts_engine.setProperty("volume", 1.0)
-            except Exception:
+            except Exception as ex:
+                print(f"[TTS INIT ERROR] {ex}")
                 self.tts_engine = None
-
-        if self.tts_engine is not None:
-            self.start_tts_worker()
 
         self.load_persistent_memory()
         self.start_reminder_worker()
@@ -334,7 +333,6 @@ class JarvisAssistant:
         if not self.prefers_concise_responses():
             return cleaned
 
-        # Strip markdown-like list formatting and compress to a few direct sentences.
         lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
         normalized = " ".join(line.lstrip("-*0123456789. ") for line in lines)
         sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", normalized) if s.strip()]
@@ -343,38 +341,6 @@ class JarvisAssistant:
             concise = normalized[:320].strip()
         return concise
 
-    def start_tts_worker(self) -> None:
-        if self.tts_engine is None:
-            return
-        if self.tts_worker is not None and self.tts_worker.is_alive():
-            return
-
-        self.tts_stop_event.clear()
-        self.tts_worker = threading.Thread(target=self._tts_worker_loop, daemon=True)
-        self.tts_worker.start()
-
-    def _tts_worker_loop(self) -> None:
-        while not self.tts_stop_event.is_set():
-            try:
-                text = self.speech_queue.get(timeout=0.2)
-            except queue.Empty:
-                continue
-
-            if text is None:
-                break
-
-            if self.tts_engine is None:
-                continue
-
-            self.tts_speaking_event.set()
-            try:
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-            except Exception:
-                self.tts_engine = None
-            finally:
-                self.tts_speaking_event.clear()
-
     def is_speaking(self) -> bool:
         return self.tts_speaking_event.is_set()
 
@@ -382,22 +348,12 @@ class JarvisAssistant:
         if self.tts_engine is not None:
             try:
                 self.tts_engine.stop()
-            except Exception:
-                pass
-
-        while not self.speech_queue.empty():
-            try:
-                self.speech_queue.get_nowait()
-            except queue.Empty:
-                break
-
+            except Exception as ex:
+                print(f"[TTS STOP ERROR] {ex}")
         self.tts_speaking_event.clear()
 
     def shutdown(self) -> None:
         self.interrupt_speech()
-        self.tts_stop_event.set()
-        if self.tts_worker is not None and self.tts_worker.is_alive():
-            self.speech_queue.put_nowait(None)
         self.reminder_stop_event.set()
 
     def _speak_with_system_fallback(self, text: str) -> bool:
@@ -432,23 +388,39 @@ class JarvisAssistant:
         return False
 
     def speak(self, text: str) -> None:
-        print(f"Jarvis: {text}")
-        if self.use_voice and self.tts_engine is not None:
-            if self.tts_worker is not None and self.tts_worker.is_alive():
-                self.speech_queue.put_nowait(text)
-                return
-
-            try:
-                self.tts_engine.say(text)
-                self.tts_engine.runAndWait()
-                return
-            except Exception:
-                self.tts_engine = None
-
-        if self.use_voice and self._speak_with_system_fallback(text):
+        text = text.strip()
+        if not text:
             return
 
-        if self.use_voice and not self.voice_warning_printed:
+        print(f"Jarvis: {text}")
+
+        if not self.use_voice:
+            return
+
+        if self.tts_engine is not None:
+            try:
+                with self.speech_lock:
+                    self.tts_speaking_event.set()
+                    self.tts_engine.say(text)
+                    self.tts_engine.runAndWait()
+                    self.tts_speaking_event.clear()
+                    return
+            except Exception as ex:
+                self.tts_speaking_event.clear()
+                print(f"[TTS ERROR] pyttsx3 failed: {ex}")
+                self.tts_engine = None
+
+        try:
+            self.tts_speaking_event.set()
+            if self._speak_with_system_fallback(text):
+                self.tts_speaking_event.clear()
+                return
+        except Exception as ex:
+            print(f"[TTS FALLBACK ERROR] {ex}")
+        finally:
+            self.tts_speaking_event.clear()
+
+        if not self.voice_warning_printed:
             print("Jarvis: Voice output is unavailable. Install/configure a local TTS engine for your OS.")
             self.voice_warning_printed = True
 
@@ -963,7 +935,8 @@ class JarvisAssistant:
             return None
         except sr.WaitTimeoutError:
             return None
-        except Exception:
+        except Exception as ex:
+            print(f"[LISTEN ERROR] {ex}")
             return None
 
     def get_text_input(self) -> str:
@@ -1358,6 +1331,9 @@ def run_self_test(
     print(f"Microphone input enabled: {use_microphone}")
     print(f"Microphone index: {mic_index if mic_index is not None else 'default'}")
 
+    if use_voice:
+        print(f"pyttsx3 engine available: {pyttsx3 is not None}")
+
     if use_microphone and sr is not None:
         try:
             names = sr.Microphone.list_microphone_names()
@@ -1459,6 +1435,7 @@ def main() -> int:
         phrase_time_limit=args.phrase_time_limit,
         mic_calibration_seconds=args.mic_calibration_seconds,
     )
+
     assistant.speak(f"Jarvis online. Good to see you, {assistant.display_name()}. Say help for commands.")
     assistant.check_due_reminders()
 
@@ -1473,21 +1450,26 @@ def main() -> int:
         if not llm_ready:
             assistant.speak(f'If needed, run: ollama pull {args.model}')
         else:
-            # Warm the model in the background to reduce first-response latency.
             threading.Thread(target=llm_client.prewarm, daemon=True).start()
 
-    while True:
-        if assistant.use_microphone:
-            raw = assistant.listen()
-            if not raw:
-                continue
-        else:
-            raw = assistant.get_text_input()
-        command = assistant.normalize_command(raw)
-        keep_running = assistant.handle_command(command)
-        if not keep_running:
-            assistant.shutdown()
-            return 0
+    try:
+        while True:
+            if assistant.use_microphone:
+                raw = assistant.listen()
+                if not raw:
+                    continue
+            else:
+                raw = assistant.get_text_input()
+
+            command = assistant.normalize_command(raw)
+            keep_running = assistant.handle_command(command)
+            if not keep_running:
+                assistant.shutdown()
+                return 0
+    except KeyboardInterrupt:
+        assistant.speak("Stopping Jarvis.")
+        assistant.shutdown()
+        return 0
 
 
 if __name__ == "__main__":
