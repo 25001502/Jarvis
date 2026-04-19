@@ -1043,7 +1043,8 @@ class JarvisAssistant:
             return None
 
     def get_disk_usage(self) -> str:
-        total, used, free = shutil.disk_usage("/")
+        disk_path = os.path.expanduser("~") if "windows" in platform.system().lower() else "/"
+        total, used, free = shutil.disk_usage(disk_path)
         total_gb = total / (1 << 30)
         used_gb = used / (1 << 30)
         free_gb = free / (1 << 30)
@@ -1135,7 +1136,7 @@ class JarvisAssistant:
             return None
 
         expr = expression.strip()
-        expr = re.sub(r"(\d)\s*\*\*\s*(\d)", r"\1**\2", expr)
+        expr = re.sub(r"(\d+)\s*\*\*\s*(\d+)", r"\1**\2", expr)
         expr = re.sub(r"\^", "**", expr)
 
         safe_funcs = {
@@ -1153,7 +1154,9 @@ class JarvisAssistant:
             "e": math.e,
         }
 
-        if not re.fullmatch(r"[0-9a-z\.\+\-\*\/\(\)\s%,]+", expr):
+        allowed_names = set(safe_funcs.keys())
+
+        if not re.fullmatch(r"[0-9a-z\.\+\-\*\/\(\)\s%]+", expr):
             return None
 
         allowed_nodes = (
@@ -1184,7 +1187,7 @@ class JarvisAssistant:
                 return None
             if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
                 return None
-            if isinstance(node, ast.Name) and node.id not in safe_funcs:
+            if isinstance(node, ast.Name) and node.id not in allowed_names:
                 return None
 
         try:
@@ -1218,8 +1221,8 @@ class JarvisAssistant:
     }
 
     def convert_unit(self, value: float, from_unit: str, to_unit: str) -> float | None:
-        fu = from_unit.lower().rstrip("s").replace("kilomet", "km").replace("meter", "m")
-        tu = to_unit.lower().rstrip("s").replace("kilomet", "km").replace("meter", "m")
+        fu = from_unit.lower().strip()
+        tu = to_unit.lower().strip()
 
         # Temperature special cases
         if fu in ("c", "celsius") and tu in ("f", "fahrenheit"):
@@ -1229,11 +1232,16 @@ class JarvisAssistant:
 
         # Normalize common synonyms
         synonyms = {
-            "kilometer": "km", "mi": "miles", "mile": "miles",
-            "kilogram": "kg", "pound": "lbs", "lb": "lbs",
-            "centimeter": "cm", "inch": "inches",
+            "kilometers": "km", "kilometer": "km", "kilometres": "km", "kilometre": "km",
+            "mi": "miles", "mile": "miles",
+            "kilograms": "kg", "kilogram": "kg",
+            "pounds": "lbs", "pound": "lbs", "lb": "lbs",
+            "centimeters": "cm", "centimeter": "cm", "centimetres": "cm",
+            "inch": "inches",
             "foot": "feet", "ft": "feet",
-            "liter": "liters", "gallon": "gallons", "gal": "gallons",
+            "meters": "m", "meter": "m", "metres": "m", "metre": "m",
+            "liters": "liters", "liter": "liters", "litres": "liters", "litre": "liters",
+            "gallons": "gallons", "gallon": "gallons", "gal": "gallons",
         }
         fu = synonyms.get(fu, fu)
         tu = synonyms.get(tu, tu)
@@ -1745,8 +1753,8 @@ class JarvisAssistant:
             self.speak(f"It is {result}.")
             return True
 
-        if command.startswith("roll a die") or command.startswith("roll a dice") or command == "roll":
-            sides_match = re.search(r"(\d+)\s*sid", command)
+        if re.match(r"roll\b", command) and ("die" in command or "dice" in command or command == "roll"):
+            sides_match = re.search(r"(\d+)[-\s]*sid(?:e[ds]?)?", command)
             sides = int(sides_match.group(1)) if sides_match else 6
             result = self.roll_dice(sides)
             self.speak(f"You rolled a {result}.")
