@@ -2,9 +2,13 @@ import argparse
 import ast
 import datetime as dt
 import json
+import math
+import os
 import platform
 from pathlib import Path
+import random
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -879,17 +883,74 @@ class JarvisAssistant:
         return True
 
     def open_application(self, app_name: str) -> bool:
-        app_map = {
+        system_name = platform.system().lower()
+
+        windows_map = {
             "notepad": ["notepad"],
             "calculator": ["calc"],
             "calc": ["calc"],
             "paint": ["mspaint"],
             "explorer": ["explorer"],
+            "file explorer": ["explorer"],
             "terminal": ["powershell"],
             "powershell": ["powershell"],
+            "cmd": ["cmd"],
+            "command prompt": ["cmd"],
             "code": ["code"],
             "vscode": ["code"],
+            "visual studio code": ["code"],
+            "task manager": ["taskmgr"],
+            "settings": ["start", "ms-settings:"],
+            "control panel": ["control"],
+            "snipping tool": ["snippingtool"],
+            "wordpad": ["wordpad"],
+            "browser": ["start", "https://"],
+            "edge": ["start", "msedge:"],
+            "chrome": ["start", "chrome"],
+            "firefox": ["start", "firefox"],
+            "spotify": ["start", "spotify:"],
+            "discord": ["start", "discord:"],
         }
+
+        linux_map = {
+            "terminal": ["x-terminal-emulator"],
+            "files": ["xdg-open", "."],
+            "file manager": ["xdg-open", "."],
+            "browser": ["xdg-open", "https://"],
+            "calculator": ["gnome-calculator"],
+            "calc": ["gnome-calculator"],
+            "text editor": ["gedit"],
+            "code": ["code"],
+            "vscode": ["code"],
+            "visual studio code": ["code"],
+            "firefox": ["firefox"],
+            "chrome": ["google-chrome"],
+        }
+
+        mac_map = {
+            "terminal": ["open", "-a", "Terminal"],
+            "finder": ["open", "-a", "Finder"],
+            "browser": ["open", "-a", "Safari"],
+            "safari": ["open", "-a", "Safari"],
+            "chrome": ["open", "-a", "Google Chrome"],
+            "firefox": ["open", "-a", "Firefox"],
+            "calculator": ["open", "-a", "Calculator"],
+            "calc": ["open", "-a", "Calculator"],
+            "notes": ["open", "-a", "Notes"],
+            "code": ["open", "-a", "Visual Studio Code"],
+            "vscode": ["open", "-a", "Visual Studio Code"],
+            "visual studio code": ["open", "-a", "Visual Studio Code"],
+            "settings": ["open", "-a", "System Preferences"],
+            "spotify": ["open", "-a", "Spotify"],
+            "discord": ["open", "-a", "Discord"],
+        }
+
+        if "windows" in system_name:
+            app_map = windows_map
+        elif "darwin" in system_name:
+            app_map = mac_map
+        else:
+            app_map = linux_map
 
         launch_cmd = app_map.get(app_name)
         if not launch_cmd:
@@ -906,6 +967,350 @@ class JarvisAssistant:
 
     def search_web(self, query: str) -> None:
         webbrowser.open(f"https://www.google.com/search?q={quote_plus(query)}")
+
+    # ── Weather via wttr.in (no API key needed) ──────────────────────
+
+    def fetch_weather(self, location: str = "") -> str | None:
+        loc = quote_plus(location.strip()) if location.strip() else ""
+        url = f"https://wttr.in/{loc}?format=%l:+%C+%t+%h+humidity+wind+%w&m"
+        req = url_request.Request(url, headers={"User-Agent": "Jarvis/1.0"})
+        try:
+            with url_request.urlopen(req, timeout=10) as resp:
+                text = resp.read().decode("utf-8").strip()
+                if "Unknown location" in text or "Sorry" in text:
+                    return None
+                return text
+        except Exception:
+            return None
+
+    # ── Wikipedia summary (no API key needed) ────────────────────────
+
+    def fetch_wikipedia_summary(self, topic: str) -> str | None:
+        encoded = quote_plus(topic.strip())
+        url = (
+            f"https://en.wikipedia.org/api/rest_v1/page/summary/{encoded}"
+        )
+        req = url_request.Request(url, headers={"User-Agent": "Jarvis/1.0"})
+        try:
+            with url_request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                extract = data.get("extract", "").strip()
+                if not extract:
+                    return None
+                sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", extract) if s.strip()]
+                return " ".join(sentences[:4])
+        except Exception:
+            return None
+
+    # ── Countdown timer ──────────────────────────────────────────────
+
+    def start_timer(self, seconds: int, label: str = "Timer") -> None:
+        def _timer_callback() -> None:
+            time.sleep(seconds)
+            self.speak(f"{label} is up! {seconds} seconds have elapsed.")
+
+        thread = threading.Thread(target=_timer_callback, daemon=True)
+        thread.start()
+
+    def parse_timer_request(self, command: str) -> tuple[int, str] | None:
+        match = re.search(
+            r"(?:set\s+(?:a\s+)?timer|timer)\s+(?:for\s+)?(\d+)\s*(second|seconds|sec|minute|minutes|min|hour|hours|hr)",
+            command,
+        )
+        if not match:
+            return None
+        amount = int(match.group(1))
+        unit = match.group(2).lower()
+        if "min" in unit:
+            amount *= 60
+        elif "hour" in unit or "hr" in unit:
+            amount *= 3600
+        label = f"{match.group(1)} {match.group(2)} timer"
+        return amount, label
+
+    # ── System info helpers ──────────────────────────────────────────
+
+    def get_ip_address(self) -> str | None:
+        try:
+            req = url_request.Request(
+                "https://api.ipify.org?format=json",
+                headers={"User-Agent": "Jarvis/1.0"},
+            )
+            with url_request.urlopen(req, timeout=5) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data.get("ip")
+        except Exception:
+            return None
+
+    def get_disk_usage(self) -> str:
+        total, used, free = shutil.disk_usage("/")
+        total_gb = total / (1 << 30)
+        used_gb = used / (1 << 30)
+        free_gb = free / (1 << 30)
+        pct = (used / total) * 100 if total else 0
+        return f"Disk: {used_gb:.1f} GB used of {total_gb:.1f} GB ({pct:.0f}% used), {free_gb:.1f} GB free"
+
+    def get_uptime(self) -> str | None:
+        system_name = platform.system().lower()
+        try:
+            if "linux" in system_name:
+                with open("/proc/uptime") as f:
+                    secs = float(f.read().split()[0])
+            elif "darwin" in system_name:
+                result = subprocess.run(
+                    ["sysctl", "-n", "kern.boottime"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                match = re.search(r"sec\s*=\s*(\d+)", result.stdout)
+                if not match:
+                    return None
+                boot = int(match.group(1))
+                secs = time.time() - boot
+            elif "windows" in system_name:
+                result = subprocess.run(
+                    ["wmic", "os", "get", "LastBootUpTime"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                lines = [l.strip() for l in result.stdout.splitlines() if l.strip() and l.strip() != "LastBootUpTime"]
+                if not lines:
+                    return None
+                raw = lines[0].split(".")[0]
+                boot_dt = dt.datetime.strptime(raw, "%Y%m%d%H%M%S")
+                secs = (dt.datetime.now() - boot_dt).total_seconds()
+            else:
+                return None
+
+            days = int(secs // 86400)
+            hours = int((secs % 86400) // 3600)
+            mins = int((secs % 3600) // 60)
+            parts = []
+            if days:
+                parts.append(f"{days} day{'s' if days != 1 else ''}")
+            if hours:
+                parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+            parts.append(f"{mins} minute{'s' if mins != 1 else ''}")
+            return ", ".join(parts)
+        except Exception:
+            return None
+
+    # ── Random / coin flip ───────────────────────────────────────────
+
+    def coin_flip(self) -> str:
+        return random.choice(["heads", "tails"])
+
+    def roll_dice(self, sides: int = 6) -> int:
+        return random.randint(1, max(sides, 2))
+
+    def pick_random(self, options: list[str]) -> str:
+        return random.choice(options)
+
+    # ── Jokes ────────────────────────────────────────────────────────
+
+    _JOKES = [
+        "Why do programmers prefer dark mode? Because light attracts bugs.",
+        "There are 10 types of people in the world: those who understand binary and those who don't.",
+        "A SQL query walks into a bar, sees two tables, and asks: Can I join you?",
+        "Why was the JavaScript developer sad? Because he didn't Node how to Express himself.",
+        "What is a computer's least favorite food? Spam.",
+        "How many programmers does it take to change a light bulb? None, that is a hardware problem.",
+        "Why did the developer go broke? Because he used up all his cache.",
+        "What is the object-oriented way to become wealthy? Inheritance.",
+        "Why do Java developers wear glasses? Because they cannot C#.",
+        "!false. It is funny because it is true.",
+    ]
+
+    def tell_joke(self) -> str:
+        return random.choice(self._JOKES)
+
+    # ── Enhanced calculator with math functions ──────────────────────
+
+    def evaluate_expression_enhanced(self, expression: str) -> float | None:
+        if not expression or len(expression) > 200:
+            return None
+
+        expr = expression.strip()
+        expr = re.sub(r"(\d)\s*\*\*\s*(\d)", r"\1**\2", expr)
+        expr = re.sub(r"\^", "**", expr)
+
+        safe_funcs = {
+            "sqrt": math.sqrt,
+            "sin": math.sin,
+            "cos": math.cos,
+            "tan": math.tan,
+            "log": math.log10,
+            "ln": math.log,
+            "abs": abs,
+            "round": round,
+            "floor": math.floor,
+            "ceil": math.ceil,
+            "pi": math.pi,
+            "e": math.e,
+        }
+
+        if not re.fullmatch(r"[0-9a-z\.\+\-\*\/\(\)\s%,]+", expr):
+            return None
+
+        allowed_nodes = (
+            ast.Expression,
+            ast.BinOp,
+            ast.UnaryOp,
+            ast.Call,
+            ast.Add,
+            ast.Sub,
+            ast.Mult,
+            ast.Div,
+            ast.Mod,
+            ast.Pow,
+            ast.USub,
+            ast.UAdd,
+            ast.Constant,
+            ast.Load,
+            ast.Name,
+        )
+
+        try:
+            tree = ast.parse(expr, mode="eval")
+        except Exception:
+            return None
+
+        for node in ast.walk(tree):
+            if not isinstance(node, allowed_nodes):
+                return None
+            if isinstance(node, ast.Constant) and not isinstance(node.value, (int, float)):
+                return None
+            if isinstance(node, ast.Name) and node.id not in safe_funcs:
+                return None
+
+        try:
+            result = eval(  # noqa: S307
+                compile(tree, "<jarvis-calc>", "eval"),
+                {"__builtins__": {}},
+                safe_funcs,
+            )
+        except Exception:
+            return None
+
+        if not isinstance(result, (int, float)):
+            return None
+        return float(result)
+
+    # ── Unit conversion ──────────────────────────────────────────────
+
+    _UNIT_CONVERSIONS: dict[tuple[str, str], float] = {
+        ("km", "miles"): 0.621371,
+        ("miles", "km"): 1.60934,
+        ("kg", "lbs"): 2.20462,
+        ("lbs", "kg"): 0.453592,
+        ("cm", "inches"): 0.393701,
+        ("inches", "cm"): 2.54,
+        ("m", "feet"): 3.28084,
+        ("feet", "m"): 0.3048,
+        ("c", "f"): None,  # special formula
+        ("f", "c"): None,  # special formula
+        ("liters", "gallons"): 0.264172,
+        ("gallons", "liters"): 3.78541,
+    }
+
+    def convert_unit(self, value: float, from_unit: str, to_unit: str) -> float | None:
+        fu = from_unit.lower().rstrip("s").replace("kilomet", "km").replace("meter", "m")
+        tu = to_unit.lower().rstrip("s").replace("kilomet", "km").replace("meter", "m")
+
+        # Temperature special cases
+        if fu in ("c", "celsius") and tu in ("f", "fahrenheit"):
+            return value * 9 / 5 + 32
+        if fu in ("f", "fahrenheit") and tu in ("c", "celsius"):
+            return (value - 32) * 5 / 9
+
+        # Normalize common synonyms
+        synonyms = {
+            "kilometer": "km", "mi": "miles", "mile": "miles",
+            "kilogram": "kg", "pound": "lbs", "lb": "lbs",
+            "centimeter": "cm", "inch": "inches",
+            "foot": "feet", "ft": "feet",
+            "liter": "liters", "gallon": "gallons", "gal": "gallons",
+        }
+        fu = synonyms.get(fu, fu)
+        tu = synonyms.get(tu, tu)
+
+        factor = self._UNIT_CONVERSIONS.get((fu, tu))
+        if factor is not None:
+            return value * factor
+        return None
+
+    def parse_conversion(self, command: str) -> tuple[float, str, str] | None:
+        match = re.search(
+            r"convert\s+([\d.]+)\s+(\w+)\s+(?:to|in|into)\s+(\w+)",
+            command,
+        )
+        if not match:
+            return None
+        try:
+            value = float(match.group(1))
+        except ValueError:
+            return None
+        return value, match.group(2), match.group(3)
+
+    # ── Clipboard ────────────────────────────────────────────────────
+
+    def copy_to_clipboard(self, text: str) -> bool:
+        system_name = platform.system().lower()
+        try:
+            if "windows" in system_name:
+                process = subprocess.Popen(
+                    ["clip"], stdin=subprocess.PIPE, shell=False,
+                )
+                process.communicate(text.encode("utf-16le"))
+                return process.returncode == 0
+            elif "darwin" in system_name:
+                process = subprocess.Popen(
+                    ["pbcopy"], stdin=subprocess.PIPE,
+                )
+                process.communicate(text.encode("utf-8"))
+                return process.returncode == 0
+            else:
+                for cmd in [["xclip", "-selection", "clipboard"], ["xsel", "--clipboard", "--input"]]:
+                    try:
+                        process = subprocess.Popen(cmd, stdin=subprocess.PIPE)
+                        process.communicate(text.encode("utf-8"))
+                        if process.returncode == 0:
+                            return True
+                    except FileNotFoundError:
+                        continue
+                return False
+        except Exception:
+            return False
+
+    def read_clipboard(self) -> str | None:
+        system_name = platform.system().lower()
+        try:
+            if "windows" in system_name:
+                result = subprocess.run(
+                    ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
+                    capture_output=True, text=True, timeout=5, check=False,
+                )
+                return result.stdout.strip() if result.returncode == 0 else None
+            elif "darwin" in system_name:
+                result = subprocess.run(
+                    ["pbpaste"], capture_output=True, text=True, timeout=5, check=False,
+                )
+                return result.stdout.strip() if result.returncode == 0 else None
+            else:
+                for cmd in [["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]]:
+                    try:
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5, check=False)
+                        if result.returncode == 0:
+                            return result.stdout.strip()
+                    except FileNotFoundError:
+                        continue
+                return None
+        except Exception:
+            return None
 
     def list_files(self, folder: str = ".") -> list[str]:
         base = Path(folder)
@@ -1030,10 +1435,12 @@ class JarvisAssistant:
 
         if command in {"help", "commands", "what can you do"}:
             self.speak(
-                "I can hold human-like conversations, remember your preferences, help plan goals, "
-                "and run actions on your machine. Try: my name is Alex, I prefer concise answers, "
-                "plan build my bot, remind me to stretch in 30 minutes, execute open google then search local ai, "
-                "llm status, and exit."
+                "I can hold conversations, remember your preferences, plan goals, run actions on your machine, "
+                "check the weather, look up Wikipedia, set timers, do math and unit conversions, "
+                "flip a coin, tell jokes, show system info, and manage your clipboard. "
+                "Try: weather London, wiki Python, timer for 5 minutes, convert 100 km to miles, "
+                "flip a coin, tell me a joke, system info, my ip, disk usage, "
+                "copy to clipboard hello world, or say help for more."
             )
             return True
 
@@ -1161,19 +1568,21 @@ class JarvisAssistant:
             expression = command.replace("calculate ", "", 1)
             if command.startswith("what is "):
                 expression = command.replace("what is ", "", 1).strip().rstrip("?")
-            value = self.evaluate_expression(expression.strip())
+            value = self.evaluate_expression_enhanced(expression.strip())
+            if value is None:
+                value = self.evaluate_expression(expression.strip())
             if value is None:
                 if command.startswith("calculate "):
-                    self.speak("I could not parse that calculation. Try: calculate (24*7)-5.")
+                    self.speak("I could not parse that calculation. Try: calculate sqrt(144) or calculate 2^10.")
                     return True
             else:
-                if value.is_integer():
+                if isinstance(value, float) and value.is_integer():
                     self.speak(f"The result is {int(value)}.")
                 else:
                     self.speak(f"The result is {round(value, 6)}.")
                 return True
         if command.startswith("calculate "):
-            self.speak("I could not parse that calculation. Try: calculate (24*7)-5.")
+            self.speak("I could not parse that calculation. Try: calculate sqrt(144) or calculate 2^10.")
             return True
 
         if "open youtube" in command:
@@ -1260,8 +1669,155 @@ class JarvisAssistant:
             return True
 
         if "system status" in command or "system info" in command:
-            info = f"{platform.system()} {platform.release()}, Python {platform.python_version()}"
-            self.speak(info)
+            parts = [f"{platform.system()} {platform.release()}, Python {platform.python_version()}"]
+            uptime = self.get_uptime()
+            if uptime:
+                parts.append(f"Uptime: {uptime}")
+            parts.append(self.get_disk_usage())
+            self.speak(". ".join(parts))
+            return True
+
+        # ── Weather ──────────────────────────────────────────────────
+        if command.startswith("weather") or command.startswith("what's the weather"):
+            location = ""
+            if command.startswith("weather "):
+                location = command.replace("weather ", "", 1).strip()
+            elif command.startswith("what's the weather in "):
+                location = command.replace("what's the weather in ", "", 1).strip()
+            elif command.startswith("what's the weather"):
+                location = ""
+            self.speak("Checking the weather...")
+            result = self.fetch_weather(location)
+            if result:
+                self.speak(result)
+            else:
+                self.speak("I could not get weather data right now. Try: weather London.")
+            return True
+
+        # ── Wikipedia ────────────────────────────────────────────────
+        if command.startswith(("wiki ", "wikipedia ", "look up ", "define ")):
+            for prefix in ("wikipedia ", "wiki ", "look up ", "define "):
+                if command.startswith(prefix):
+                    topic = command.replace(prefix, "", 1).strip()
+                    break
+            if topic:
+                self.speak(f"Looking up {topic}...")
+                summary = self.fetch_wikipedia_summary(topic)
+                if summary:
+                    self.speak(summary)
+                else:
+                    self.speak(f"I could not find a Wikipedia article for {topic}.")
+            else:
+                self.speak("What should I look up?")
+            return True
+
+        # ── Timer ────────────────────────────────────────────────────
+        timer_result = self.parse_timer_request(command)
+        if timer_result is not None:
+            seconds, label = timer_result
+            self.start_timer(seconds, label)
+            if seconds >= 3600:
+                display = f"{seconds // 3600} hour{'s' if seconds >= 7200 else ''}"
+            elif seconds >= 60:
+                display = f"{seconds // 60} minute{'s' if seconds >= 120 else ''}"
+            else:
+                display = f"{seconds} second{'s' if seconds != 1 else ''}"
+            self.speak(f"Timer set for {display}. I will notify you when it is up.")
+            return True
+
+        # ── Unit conversion ──────────────────────────────────────────
+        conv = self.parse_conversion(command)
+        if conv is not None:
+            value, from_unit, to_unit = conv
+            result = self.convert_unit(value, from_unit, to_unit)
+            if result is not None:
+                if isinstance(result, float) and result == int(result):
+                    self.speak(f"{value} {from_unit} is {int(result)} {to_unit}.")
+                else:
+                    self.speak(f"{value} {from_unit} is {round(result, 4)} {to_unit}.")
+            else:
+                self.speak(f"I do not know how to convert {from_unit} to {to_unit} yet.")
+            return True
+
+        # ── Coin flip / dice / random pick ───────────────────────────
+        if "flip a coin" in command or "coin flip" in command or command == "flip":
+            result = self.coin_flip()
+            self.speak(f"It is {result}.")
+            return True
+
+        if command.startswith("roll a die") or command.startswith("roll a dice") or command == "roll":
+            sides_match = re.search(r"(\d+)\s*sid", command)
+            sides = int(sides_match.group(1)) if sides_match else 6
+            result = self.roll_dice(sides)
+            self.speak(f"You rolled a {result}.")
+            return True
+
+        if command.startswith("pick ") or command.startswith("choose "):
+            parts_text = command.replace("pick ", "", 1).replace("choose ", "", 1).strip()
+            options = [o.strip() for o in re.split(r",|\bor\b", parts_text) if o.strip()]
+            if len(options) >= 2:
+                choice = self.pick_random(options)
+                self.speak(f"I pick {choice}.")
+                return True
+
+        # ── Jokes ────────────────────────────────────────────────────
+        if "joke" in command or "make me laugh" in command or "funny" in command:
+            self.speak(self.tell_joke())
+            return True
+
+        # ── IP address ───────────────────────────────────────────────
+        if "my ip" in command or "ip address" in command:
+            self.speak("Looking up your public IP address...")
+            ip = self.get_ip_address()
+            if ip:
+                self.speak(f"Your public IP address is {ip}.")
+            else:
+                self.speak("I could not determine your public IP address.")
+            return True
+
+        # ── Disk usage ───────────────────────────────────────────────
+        if "disk usage" in command or "disk space" in command or "storage" in command:
+            self.speak(self.get_disk_usage())
+            return True
+
+        # ── Uptime ───────────────────────────────────────────────────
+        if "uptime" in command:
+            uptime = self.get_uptime()
+            if uptime:
+                self.speak(f"System uptime is {uptime}.")
+            else:
+                self.speak("I could not determine system uptime.")
+            return True
+
+        # ── Clipboard ────────────────────────────────────────────────
+        if command.startswith("copy to clipboard ") or command.startswith("clipboard copy "):
+            text = command.replace("copy to clipboard ", "", 1).replace("clipboard copy ", "", 1).strip()
+            if text:
+                if self.copy_to_clipboard(text):
+                    self.speak("Copied to clipboard.")
+                else:
+                    self.speak("I could not copy to clipboard. A clipboard tool may not be installed.")
+            else:
+                self.speak("What should I copy to the clipboard?")
+            return True
+
+        if command in {"paste clipboard", "read clipboard", "what's on my clipboard", "clipboard"}:
+            content = self.read_clipboard()
+            if content:
+                preview = content[:200]
+                self.speak(f"Your clipboard contains: {preview}")
+            else:
+                self.speak("Your clipboard is empty or I cannot access it.")
+            return True
+
+        # ── Google shortcut ──────────────────────────────────────────
+        if command.startswith("google "):
+            query = command.replace("google ", "", 1).strip()
+            if query:
+                escaped_query = query.replace('"', '\\"')
+                self.emit_action(f'search_web("{escaped_query}")', f"Searching Google for {query}.")
+                self.search_web(query)
+                self.speak(f"Searching Google for {query}.")
             return True
 
         if any(greet in command for greet in ["hello", "hi", "hey"]):
@@ -1289,8 +1845,8 @@ class JarvisAssistant:
 
         self.speak(
             "I can respond conversationally or run commands. "
-            "If you want an action, ask me to open, search, list files, or plan a task. "
-            "You can also ask for llm status."
+            "Try: weather, wiki, timer, calculate, convert, flip a coin, joke, system info, "
+            "open, search, list files, plan, or say help."
         )
         return True
 
