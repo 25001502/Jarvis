@@ -260,6 +260,7 @@ class JarvisAssistant:
             self.memory["user_goal"] = saved_memory.get("user_goal")
             self.memory["ongoing_task"] = saved_memory.get("ongoing_task")
             self.memory["notes"] = list(saved_memory.get("notes", []))[-8:]
+            self.memory["previous_commands"] = list(saved_memory.get("previous_commands", []))[-8:]
             loaded_reminders = list(saved_memory.get("reminders", []))
             valid_reminders = []
             for item in loaded_reminders:
@@ -294,6 +295,7 @@ class JarvisAssistant:
                 "user_goal": self.memory.get("user_goal"),
                 "ongoing_task": self.memory.get("ongoing_task"),
                 "notes": self.memory.get("notes", [])[-8:],
+                "previous_commands": self.memory.get("previous_commands", [])[-8:],
                 "reminders": self.memory.get("reminders", [])[-40:],
             },
             "profile": {
@@ -1038,13 +1040,14 @@ class JarvisAssistant:
             return True
 
         if command.startswith(("execute ", "do this ", "do this:", "run plan ")):
-            request = (
-                command.replace("do this:", "", 1)
-                .replace("do this ", "", 1)
-                .replace("execute ", "", 1)
-                .replace("run plan ", "", 1)
-                .strip()
-            )
+            if command.startswith("execute "):
+                request = command[len("execute "):].strip()
+            elif command.startswith("do this:"):
+                request = command[len("do this:"):].strip()
+            elif command.startswith("do this "):
+                request = command[len("do this "):].strip()
+            else:
+                request = command[len("run plan "):].strip()
             actions = self.plan_actions_from_text(request)
             if not actions:
                 self.speak("I could not build an action plan from that request yet.")
@@ -1172,9 +1175,6 @@ class JarvisAssistant:
                 else:
                     self.speak(f"The result is {round(value, 6)}.")
                 return True
-        if command.startswith("calculate "):
-            self.speak("I could not parse that calculation. Try: calculate (24*7)-5.")
-            return True
 
         if "open youtube" in command:
             self.emit_action('open_website("https://www.youtube.com")', "Opening YouTube for you.")
