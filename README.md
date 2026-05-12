@@ -4,6 +4,7 @@ A Python-based voice-activated personal assistant inspired by JARVIS from Iron M
 
 ## Features
 
+- **🎨 Modern GUI Interface**: Sleek, futuristic tech-inspired graphical interface (NEW!)
 - **Voice Interaction**: Speak to Jarvis and get voice responses
 - **Keyboard Input Mode**: Type commands if you prefer or lack microphone access
 - **Local LLM Integration**: Connect to Ollama for advanced conversational AI
@@ -59,12 +60,33 @@ brew install portaudio
 
 ## Quick Start
 
-### Windows (Voice Mode)
+### 🎨 GUI Mode (Recommended)
+
+Experience Jarvis with a sleek, futuristic interface:
+
+**Windows:**
+```bash
+start_jarvis_gui.bat
+```
+
+**Linux/Mac:**
+```bash
+./start_jarvis_gui.sh
+```
+
+**Manual Start:**
+```bash
+python jarvis_gui.py
+```
+
+### 🎤 Voice Mode (Command Line)
+
+**Windows:**
 ```bash
 start_jarvis_voice.bat
 ```
 
-### Linux/Mac (Voice Mode)
+**Linux/Mac:**
 ```bash
 ./start_jarvis_voice.sh
 ```
@@ -209,13 +231,50 @@ python jarvis.py --self-test
 
 ```
 Jarvis/
-├── jarvis.py                   # Main application
+├── jarvis.py                   # Main application (CLI)
+├── jarvis_gui.py               # GUI application (NEW!)
 ├── requirements.txt            # Python dependencies
-├── start_jarvis_voice.bat      # Windows launcher
-├── start_jarvis_voice.sh       # Linux/Mac launcher
+├── start_jarvis_voice.bat      # Windows voice launcher
+├── start_jarvis_voice.sh       # Linux/Mac voice launcher
+├── start_jarvis_gui.bat        # Windows GUI launcher (NEW!)
+├── start_jarvis_gui.sh         # Linux/Mac GUI launcher (NEW!)
 ├── .jarvis_memory.json         # Persistent memory (auto-created)
 └── README.md                   # This file
 ```
+
+## GUI Features
+
+The new GUI mode provides a modern, tech-inspired interface with:
+
+### Visual Elements
+- **Futuristic Design**: Dark theme with cyan/blue accent colors inspired by sci-fi interfaces
+- **Animated Waveform**: Real-time animated visualization at the top of the window
+- **Conversation Log**: Scrollable conversation history with color-coded messages
+- **Status Indicators**: Live system status, LLM connection, and reminder count
+
+### Enhanced Experience
+- **Command Input**: Easy-to-use text input field with Execute button
+- **Real-time Updates**: Status information updates automatically
+- **Keyboard Shortcuts**: Press Enter to submit commands quickly
+- **Clean Interface**: Distraction-free design focused on productivity
+
+### GUI-Specific Options
+```bash
+# Run with custom LLM model
+python jarvis_gui.py --model llama3.2:3b
+
+# Run without LLM
+python jarvis_gui.py --no-llm
+
+# Custom memory file
+python jarvis_gui.py --memory-file custom_memory.json
+```
+
+**Note**: For the best GUI experience, install customtkinter:
+```bash
+pip install customtkinter
+```
+The GUI will work with standard tkinter if customtkinter is not available.
 
 ## Memory Persistence
 
